@@ -67,31 +67,16 @@ jobs:
           tar -czf dist/modules.tar.gz -C dist/modules lib 2>/dev/null || true
           ls -lh dist/
 
-      - name: Get mkbootimg (AOSP tool)
+      - name: Pack full boot.img (new kernel + stock ramdisk + stock signature)
         run: |
-          if ! git clone --depth 1 --branch master \
-               https://github.com/LineageOS/android_system_tools_mkbootimg.git /tmp/mkbootimg 2>/dev/null; then
-            echo "git clone failed, falling back to raw file download"
-            mkdir -p /tmp/mkbootimg/gki
-            curl -sL --retry 3 -o /tmp/mkbootimg/mkbootimg.py \
-              https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/master/mkbootimg.py
-            curl -sL --retry 3 -o /tmp/mkbootimg/gki/generate_gki_certificate.py \
-              https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/master/gki/generate_gki_certificate.py
-          fi
-          ls -la /tmp/mkbootimg /tmp/mkbootimg/gki
-          python3 /tmp/mkbootimg/mkbootimg.py --help >/dev/null 2>&1 && echo "mkbootimg OK" || { echo "mkbootimg 不可用"; exit 1; }
-
-      - name: Pack boot.img (GKI boot header v4)
-        run: |
-          python3 /tmp/mkbootimg/mkbootimg.py \
-            --kernel dist/Image.gz \
-            --output dist/boot.img \
-            --base 0x00000000 \
-            --kernel_offset 0x00008000 \
-            --ramdisk_offset 0x00000000 \
-            --tags_offset 0x00000100 \
-            --pagesize 4096 \
-            --header_version 4
+          # 使用仓库内解包产物（stock/ramdisk + stock/boot_signature，来源=设备现刷包）
+          # 重打包为新内核 Image.gz + 原 ramdisk + 原签名段，结构与原镜像完全一致
+          python3 scripts/repack_boot.py \
+            dist/Image.gz \
+            stock/ramdisk \
+            stock/boot_signature \
+            0x18000199 \
+            dist/boot.img
           ls -lh dist/boot.img
           python3 - <<'EOF'
           import struct
@@ -99,16 +84,21 @@ jobs:
           magic = data[:8]
           assert magic == b'ANDROID!', f"BOOT_MAGIC 错误: {magic}"
           hv   = struct.unpack_from('<I', data, 40)[0]
-          osv  = struct.unpack_from('<I', data, 44)[0]
-          osp  = struct.unpack_from('<I', data, 48)[0]
+          osv  = struct.unpack_from('<I', data, 16)[0]
           ksz  = struct.unpack_from('<I', data, 8)[0]
+          rsz  = struct.unpack_from('<I', data, 12)[0]
+          sigsz = struct.unpack_from('<I', data, 1580)[0]
           print(f"BOOT_MAGIC: ANDROID! OK")
           print(f"header_version: {hv}  (v4 预期)")
-          print(f"os_version: 0x{osv:08x}  os_patch_level: 0x{osp:08x}")
+          print(f"os_version: 0x{osv:08x}")
           print(f"kernel_size: {ksz} ({ksz/1024/1024:.1f} MB)")
+          print(f"ramdisk_size: {rsz} ({rsz/1024:.0f} KB)")
+          print(f"boot_signature_size: {sigsz}")
           assert hv == 4, "header version 不是 4"
           assert ksz > 0, "kernel 为空"
-          print("boot.img 校验通过")
+          assert rsz > 0, "ramdisk 为空 (必须带原 ramdisk)"
+          assert sigsz == 4096, "boot_signature 缺失"
+          print("完整 boot.img 校验通过")
           EOF
 
       - name: Upload kernel artifacts
@@ -134,7 +124,7 @@ jobs:
             - 构建时间: ${{ github.event.head_commit.timestamp }}
 
             **文件说明**
-            - `boot.img` — 刷机用内核镜像 (GKI boot header v4, kernel = Image.gz)
+            - `boot.img` — 完整刷机镜像 (GKI boot header v4, 新内核 + 设备原 ramdisk + 原签名段)
             - `Image.gz` — gzip 压缩内核
             - `Image` — 未压缩内核
             - `gki_defconfig_used.config` — 实际生效的内核配置
