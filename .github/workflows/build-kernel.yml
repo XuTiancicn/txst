@@ -59,7 +59,7 @@ jobs:
           cp kernel/arch/arm64/boot/Image.gz dist/Image.gz
           cp kernel/arch/arm64/boot/Image dist/Image
           cp kernel/.config dist/gki_defconfig_used.config
-          KV=$(make -C kernel kernelversion)
+          KV=$(make -C kernel --no-print-directory kernelversion | tail -1)
           echo "KERNEL_VERSION=$KV" >> $GITHUB_ENV
           echo "kernelversion: $KV"
           cd kernel && make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH=../dist/modules modules_install 2>&1 | tail -5 || true
