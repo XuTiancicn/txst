@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: write
+
 jobs:
   build-kernel:
     name: Build android12-5.10 GKI kernel (gki_defconfig)
@@ -56,10 +59,48 @@ jobs:
           cp kernel/arch/arm64/boot/Image.gz dist/Image.gz
           cp kernel/arch/arm64/boot/Image dist/Image
           cp kernel/.config dist/gki_defconfig_used.config
+          KV=$(make -C kernel kernelversion)
+          echo "KERNEL_VERSION=$KV" >> $GITHUB_ENV
+          echo "kernelversion: $KV"
           cd kernel && make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH=../dist/modules modules_install 2>&1 | tail -5 || true
           cd ..
           tar -czf dist/modules.tar.gz -C dist/modules lib 2>/dev/null || true
           ls -lh dist/
+
+      - name: Get mkbootimg (AOSP tool)
+        run: |
+          git clone --depth 1 https://github.com/aosp-mirror/platform_system_tools_mkbootimg.git /tmp/mkbootimg
+          python3 /tmp/mkbootimg/mkbootimg.py --help >/dev/null 2>&1 && echo "mkbootimg OK" || { echo "mkbootimg.py 缺失，列目录:"; ls /tmp/mkbootimg; exit 1; }
+
+      - name: Pack boot.img (GKI boot header v4)
+        run: |
+          python3 /tmp/mkbootimg/mkbootimg.py \
+            --kernel dist/Image.gz \
+            --output dist/boot.img \
+            --base 0x00000000 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x00000000 \
+            --tags_offset 0x00000100 \
+            --pagesize 4096 \
+            --header_version 4
+          ls -lh dist/boot.img
+          python3 - <<'EOF'
+          import struct
+          data = open('dist/boot.img','rb').read(4096)
+          magic = data[:8]
+          assert magic == b'ANDROID!', f"BOOT_MAGIC 错误: {magic}"
+          hv   = struct.unpack_from('<I', data, 40)[0]
+          osv  = struct.unpack_from('<I', data, 44)[0]
+          osp  = struct.unpack_from('<I', data, 48)[0]
+          ksz  = struct.unpack_from('<I', data, 8)[0]
+          print(f"BOOT_MAGIC: ANDROID! OK")
+          print(f"header_version: {hv}  (v4 预期)")
+          print(f"os_version: 0x{osv:08x}  os_patch_level: 0x{osp:08x}")
+          print(f"kernel_size: {ksz} ({ksz/1024/1024:.1f} MB)")
+          assert hv == 4, "header version 不是 4"
+          assert ksz > 0, "kernel 为空"
+          print("boot.img 校验通过")
+          EOF
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -67,3 +108,31 @@ jobs:
           name: marble-kernel-lineage23.2
           path: dist/
           retention-days: 14
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ github.run_number }}
+          name: "Marble Kernel Build #${{ github.run_number }}"
+          body: |
+            LineageOS 23.2 (Android 16) GKI 内核构建
+
+            - 设备: 红米 Note 12 Turbo (marble) / POCO F5
+            - 内核: android12-5.10 (${{ env.KERNEL_VERSION }})
+            - 配置: gki_defconfig, LLVM=1
+            - 仓库: LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2
+            - 提交: ${{ github.sha }}
+            - 构建时间: ${{ github.event.head_commit.timestamp }}
+
+            **文件说明**
+            - `boot.img` — 刷机用内核镜像 (GKI boot header v4, kernel = Image.gz)
+            - `Image.gz` — gzip 压缩内核
+            - `Image` — 未压缩内核
+            - `gki_defconfig_used.config` — 实际生效的内核配置
+          files: |
+            dist/boot.img
+            dist/Image.gz
+            dist/Image
+            dist/gki_defconfig_used.config
+          fail_on_unmatched_files: true
+          make_latest: true
