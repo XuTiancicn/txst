@@ -1,0 +1,69 @@
+name: Build Marble Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build-kernel:
+    name: Build android12-5.10 GKI kernel (gki_defconfig)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev flex bison bc \
+            cpio libssl-dev libelf-dev \
+            clang lld llvm \
+            kmod device-tree-compiler
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: Clone LineageOS kernel source (lineage-23.2)
+        run: |
+          git clone --depth 1 --branch lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_xiaomi_sm8450.git kernel
+
+      - name: Show kernel version
+        working-directory: kernel
+        run: |
+          head -5 Makefile
+          ls arch/arm64/configs/ | grep -E 'gki|defconfig' | head
+
+      - name: Generate gki_defconfig
+        working-directory: kernel
+        run: |
+          make ARCH=arm64 LLVM=1 gki_defconfig
+          echo "---- enabled GKI core ----"
+          grep -E 'CONFIG_GKI|CONFIG_LOCALVERSION|CONFIG_CC_VERSION' .config | head
+
+      - name: Build kernel image
+        working-directory: kernel
+        run: |
+          make ARCH=arm64 LLVM=1 -j$(nproc) Image.gz 2>&1 | tail -60
+          ls -lh arch/arm64/boot/Image.gz arch/arm64/boot/Image
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp kernel/arch/arm64/boot/Image.gz dist/Image.gz
+          cp kernel/arch/arm64/boot/Image dist/Image
+          cp kernel/.config dist/gki_defconfig_used.config
+          cd kernel && make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH=../dist/modules modules_install 2>&1 | tail -5 || true
+          cd ..
+          tar -czf dist/modules.tar.gz -C dist/modules lib 2>/dev/null || true
+          ls -lh dist/
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel-lineage23.2
+          path: dist/
+          retention-days: 14
