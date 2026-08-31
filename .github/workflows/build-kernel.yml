@@ -67,15 +67,15 @@ jobs:
           tar -czf dist/modules.tar.gz -C dist/modules lib 2>/dev/null || true
           ls -lh dist/
 
-      - name: Pack full boot.img (new kernel + stock ramdisk + stock signature)
+      - name: Pack full boot.img (new kernel + stock header/ramdisk/signature)
         run: |
-          # 使用仓库内解包产物（stock/ramdisk + stock/boot_signature，来源=设备现刷包）
-          # 重打包为新内核 Image.gz + 原 ramdisk + 原签名段，结构与原镜像完全一致
+          # 解包产物（stock/header.bin + stock/ramdisk + stock/boot_signature，来源=设备现刷包）
+          # 重打包: 原镜像 header 原样复用(仅更新 kernel_size) + 新内核 + 原 ramdisk + 原签名段
           python3 scripts/repack_boot.py \
             dist/Image.gz \
+            stock/header.bin \
             stock/ramdisk \
             stock/boot_signature \
-            0x18000199 \
             dist/boot.img
           ls -lh dist/boot.img
           python3 - <<'EOF'
