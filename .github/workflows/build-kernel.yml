@@ -69,8 +69,10 @@ jobs:
 
       - name: Get mkbootimg (AOSP tool)
         run: |
-          git clone --depth 1 https://github.com/aosp-mirror/platform_system_tools_mkbootimg.git /tmp/mkbootimg
-          python3 /tmp/mkbootimg/mkbootimg.py --help >/dev/null 2>&1 && echo "mkbootimg OK" || { echo "mkbootimg.py 缺失，列目录:"; ls /tmp/mkbootimg; exit 1; }
+          mkdir -p /tmp/mkbootimg
+          curl -sL --retry 3 -o /tmp/mkbootimg/mkbootimg.py \
+            https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/master/mkbootimg.py
+          python3 /tmp/mkbootimg/mkbootimg.py --help >/dev/null 2>&1 && echo "mkbootimg OK" || { echo "mkbootimg 不可用"; exit 1; }
 
       - name: Pack boot.img (GKI boot header v4)
         run: |
