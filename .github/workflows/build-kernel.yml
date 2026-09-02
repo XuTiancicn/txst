@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-kernel:
-    name: Build android12-5.10 GKI kernel (gki_defconfig)
+    name: Build marble boot.img (source kernel Image + stock container)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -40,29 +40,72 @@ jobs:
           head -5 Makefile
           ls arch/arm64/configs/ | grep -E 'gki|defconfig' | head
 
-      - name: Generate gki_defconfig
+      - name: Generate kernel config (official gki + vendor fragments)
         working-directory: kernel
         run: |
+          # 与设备树 android_device_xiaomi_sm8450-common TARGET_KERNEL_CONFIG 一致:
+          #   gki_defconfig + vendor/waipio_GKI.config + vendor/xiaomi_GKI.config
+          #   + vendor/marble_GKI.config + vendor/debugfs.config
           make ARCH=arm64 LLVM=1 gki_defconfig
-          echo "---- enabled GKI core ----"
-          grep -E 'CONFIG_GKI|CONFIG_LOCALVERSION|CONFIG_CC_VERSION' .config | head
+          ./scripts/kconfig/merge_config.sh \
+            .config \
+            arch/arm64/configs/vendor/waipio_GKI.config \
+            arch/arm64/configs/vendor/xiaomi_GKI.config \
+            arch/arm64/configs/vendor/marble_GKI.config \
+            arch/arm64/configs/vendor/debugfs.config 2>&1 | tail -12
+          make ARCH=arm64 LLVM=1 olddefconfig
+          echo "---- key symbols ----"
+          grep -E 'CONFIG_GKI|CONFIG_LOCALVERSION|CONFIG_CC_VERSION|CONFIG_MODULES|CONFIG_ANDROID' .config | head
 
-      - name: Build kernel image
+      - name: Build kernel image (Image, uncompressed)
         working-directory: kernel
         run: |
-          make ARCH=arm64 LLVM=1 -j$(nproc) Image.gz 2>&1 | tail -60
-          ls -lh arch/arm64/boot/Image.gz arch/arm64/boot/Image
+          # 官方 boot.img 内核段为未压缩 Image（BOARD_KERNEL_IMAGE_NAME := Image）
+          make ARCH=arm64 LLVM=1 -j$(nproc) Image 2>&1 | tail -40
+          ls -lh arch/arm64/boot/Image
 
       - name: Package artifacts
         run: |
           mkdir -p dist
-          cp kernel/arch/arm64/boot/Image.gz dist/Image.gz
           cp kernel/arch/arm64/boot/Image dist/Image
           cp kernel/.config dist/gki_defconfig_used.config
           KV=$(make -C kernel --no-print-directory kernelversion | tail -1)
           echo "KERNEL_VERSION=$KV" >> $GITHUB_ENV
           echo "kernelversion: $KV"
           ls -lh dist/
+
+      - name: Pack boot.img (stock container + new kernel)
+        run: |
+          # 容器=设备现刷包解包件(stock/header.bin+ramdisk+boot_signature, 来源=官方 LOS boot 分区)
+          # 仅替换 kernel 段(未压缩 Image), ramdisk/签名/header 原样保留
+          python3 scripts/repack_boot.py \
+            dist/Image \
+            stock/header.bin \
+            stock/ramdisk \
+            stock/boot_signature \
+            dist/boot.img
+          python3 - <<'EOF'
+          import struct
+          data = open('dist/boot.img','rb').read(4096)
+          magic = data[:8]
+          assert magic == b'ANDROID!', f"BOOT_MAGIC 错误: {magic}"
+          hv   = struct.unpack_from('<I', data, 40)[0]
+          osv  = struct.unpack_from('<I', data, 16)[0]
+          ksz  = struct.unpack_from('<I', data, 8)[0]
+          rsz  = struct.unpack_from('<I', data, 12)[0]
+          sigsz = struct.unpack_from('<I', data, 1580)[0]
+          print(f"BOOT_MAGIC: ANDROID! OK")
+          print(f"header_version: {hv}  (v4 预期)")
+          print(f"os_version: 0x{osv:08x}")
+          print(f"kernel_size: {ksz} ({ksz/1024/1024:.1f} MB) — 应≈新 Image 未压缩大小")
+          print(f"ramdisk_size: {rsz} ({rsz/1024:.0f} KB)")
+          print(f"boot_signature_size: {sigsz}")
+          assert hv == 4, "header version 不是 4"
+          assert ksz > 0, "kernel 为空"
+          assert rsz > 0, "ramdisk 为空 (必须带原 ramdisk)"
+          assert sigsz == 4096, "boot_signature 缺失"
+          print("完整 boot.img 校验通过")
+          EOF
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -81,17 +124,17 @@ jobs:
 
             - 设备: 红米 Note 12 Turbo (marble) / POCO F5
             - 内核: android12-5.10 (${{ env.KERNEL_VERSION }})
-            - 配置: gki_defconfig, LLVM=1
+            - 配置: gki_defconfig + waipio/xiaomi/marble/debugfs 厂商片段 merge, LLVM=1
             - 仓库: LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2
             - 提交: ${{ github.sha }}
             - 构建时间: ${{ github.event.head_commit.timestamp }}
 
             **文件说明**
-            - `Image.gz` — gzip 压缩内核 (boot.img 内核段用这个)
-            - `Image` — 未压缩内核 (ELF 可执行)
-            - `gki_defconfig_used.config` — 实际生效的内核配置
+            - `boot.img` — 完整可刷 boot 映像 (GKI v4: 源码编译 Image + 原 ramdisk + 原签名段)
+            - `Image` — 未压缩内核 (源码编译, 官方五段 config)
+            - `gki_defconfig_used.config` — 实际生效的内核配置 (已 merge 厂商片段)
           files: |
-            dist/Image.gz
+            dist/boot.img
             dist/Image
             dist/gki_defconfig_used.config
           fail_on_unmatched_files: true

@@ -1,0 +1,22 @@
+{
+  "device": "marble (Redmi Note 12 Turbo / POCO F5)",
+  "source": "设备现刷包 boot.img 备份（unpack_bootimg.py 官方工具解包）",
+  "unpack_command": "python3 unpack_bootimg.py --boot_img boot.img --out stock_unpacked",
+  "file_size": 201326592,
+  "layout": "页对齐型 v4: header(1584B) 补零到 4096 后 kernel/ramdisk/boot_signature 各段按 4096 页对齐",
+  "header_version": 4,
+  "header_size": 1584,
+  "header_file": "stock/header.bin",
+  "kernel_size_stock": 46854828,
+  "ramdisk_size": 1380093,
+  "ramdisk_file": "stock/ramdisk",
+  "boot_signature_size": 4096,
+  "boot_signature_file": "stock/boot_signature",
+  "os_version_hex": "0x18000199",
+  "os_version": "12.0.0",
+  "os_patch_level": "2025-09",
+  "cmdline": "",
+  "name": "",
+  "repack_command": "python3 scripts/repack_boot.py dist/Image.gz stock/header.bin stock/ramdisk stock/boot_signature dist/boot.img",
+  "notes": "header.bin 为完整 1584B 原 header（复用仅改 kernel_size）；ramdisk 与 boot_signature 均由官方 unpack_bootimg.py 从设备现刷包提取，重打包时原样复用；os_version 保留原值 0x18000199 保证与 vendor 侧一致。2026-08-31 19:00 修正：补齐 header 页对齐(2512B)，新镜像与原镜像除 kernel 段外逐字节一致（本地验证通过）"
+}
