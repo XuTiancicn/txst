@@ -62,44 +62,7 @@ jobs:
           KV=$(make -C kernel --no-print-directory kernelversion | tail -1)
           echo "KERNEL_VERSION=$KV" >> $GITHUB_ENV
           echo "kernelversion: $KV"
-          cd kernel && make ARCH=arm64 LLVM=1 INSTALL_MOD_PATH=../dist/modules modules_install 2>&1 | tail -5 || true
-          cd ..
-          tar -czf dist/modules.tar.gz -C dist/modules lib 2>/dev/null || true
           ls -lh dist/
-
-      - name: Pack full boot.img (new kernel + stock header/ramdisk/signature)
-        run: |
-          # 解包产物（stock/header.bin + stock/ramdisk + stock/boot_signature，来源=设备现刷包）
-          # 重打包: 原镜像 header 原样复用(仅更新 kernel_size) + 新内核 + 原 ramdisk + 原签名段
-          python3 scripts/repack_boot.py \
-            dist/Image.gz \
-            stock/header.bin \
-            stock/ramdisk \
-            stock/boot_signature \
-            dist/boot.img
-          ls -lh dist/boot.img
-          python3 - <<'EOF'
-          import struct
-          data = open('dist/boot.img','rb').read(4096)
-          magic = data[:8]
-          assert magic == b'ANDROID!', f"BOOT_MAGIC 错误: {magic}"
-          hv   = struct.unpack_from('<I', data, 40)[0]
-          osv  = struct.unpack_from('<I', data, 16)[0]
-          ksz  = struct.unpack_from('<I', data, 8)[0]
-          rsz  = struct.unpack_from('<I', data, 12)[0]
-          sigsz = struct.unpack_from('<I', data, 1580)[0]
-          print(f"BOOT_MAGIC: ANDROID! OK")
-          print(f"header_version: {hv}  (v4 预期)")
-          print(f"os_version: 0x{osv:08x}")
-          print(f"kernel_size: {ksz} ({ksz/1024/1024:.1f} MB)")
-          print(f"ramdisk_size: {rsz} ({rsz/1024:.0f} KB)")
-          print(f"boot_signature_size: {sigsz}")
-          assert hv == 4, "header version 不是 4"
-          assert ksz > 0, "kernel 为空"
-          assert rsz > 0, "ramdisk 为空 (必须带原 ramdisk)"
-          assert sigsz == 4096, "boot_signature 缺失"
-          print("完整 boot.img 校验通过")
-          EOF
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -124,12 +87,10 @@ jobs:
             - 构建时间: ${{ github.event.head_commit.timestamp }}
 
             **文件说明**
-            - `boot.img` — 完整刷机镜像 (GKI boot header v4, 新内核 + 设备原 ramdisk + 原签名段)
-            - `Image.gz` — gzip 压缩内核
-            - `Image` — 未压缩内核
+            - `Image.gz` — gzip 压缩内核 (boot.img 内核段用这个)
+            - `Image` — 未压缩内核 (ELF 可执行)
             - `gki_defconfig_used.config` — 实际生效的内核配置
           files: |
-            dist/boot.img
             dist/Image.gz
             dist/Image
             dist/gki_defconfig_used.config
