@@ -61,7 +61,15 @@ jobs:
         working-directory: kernel
         run: |
           # 官方 boot.img 内核段为未压缩 Image（BOARD_KERNEL_IMAGE_NAME := Image）
-          make ARCH=arm64 LLVM=1 -j$(nproc) Image 2>&1 | tail -40
+          # vendor config 全量编译内存峰值高, runner 16GB 会 OOM → 加 8G swap 兜底
+          free -h
+          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile && sudo swapon /swapfile
+          free -h
+          # 日志落盘, 失败时 tail 真实错误 (管道 tail 会吞掉 make 退出码)
+          make ARCH=arm64 LLVM=1 -j$(nproc) Image > build.log 2>&1 \
+            || { echo "===== 编译失败，最后 100 行 ====="; tail -100 build.log; exit 1; }
+          tail -15 build.log
           ls -lh arch/arm64/boot/Image
 
       - name: Package artifacts
