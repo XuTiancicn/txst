@@ -54,19 +54,19 @@ jobs:
           BRANCH: ${{ inputs.branch }}
           VERSION: next
         run: |
-          ./scripts/build.sh
+          ./droidian-fastboot-builder/scripts/build.sh
 
       - name: Verify flashable output
         run: |
-          ls -lh work/out/
-          ZIP=$(ls work/out/*.zip | head -1)
+          ls -lh droidian-fastboot-builder/work/out/
+          ZIP=$(ls droidian-fastboot-builder/work/out/*.zip | head -1)
           unzip -l "$ZIP" | head -30 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: droidian-marble-${{ inputs.image_type }}-${{ github.run_number }}
-          path: work/out/*
+          path: droidian-fastboot-builder/work/out/*
           if-no-files-found: error
           retention-days: 7
 
@@ -91,6 +91,6 @@ jobs:
             **注意**: 官方 5.10.226 内核无 msm_drm 显示驱动，若黑屏请换带显示驱动的
             boot.img 后单刷（见项目 README「换内核」一节）。
           files: |
-            work/out/*.zip
+            droidian-fastboot-builder/work/out/*.zip
           fail_on_unmatched_files: true
           make_latest: false

@@ -82,12 +82,20 @@ docker exec "$CID" /bin/sh -c '
     set -ex
     cd /buildd/sources
     export DROIDIAN_VERSION="'"$VERSION"'"
-    ./generate_device_recipe.py xiaomi_marble arm64 phosh phone 32
+    # 官方签名: generate_device_recipe.py <product> <arch> <edition> <variant> <apilevel> [droidian_variant]
+    # argc>=6 才执行, 第6参留空 (=marble 默认, droidian_variant 无 "-" 前缀)
+    ./generate_device_recipe.py xiaomi_marble arm64 phosh phone 32 ""
     echo "===== generated/product.yaml ====="
     cat generated/product.yaml
     echo "===== generated/droidian.yaml ====="
     cat generated/droidian.yaml
     debos --disable-fakemachine generated/droidian.yaml
+    # debos 产物默认落在 /buildd/sources/out; 搬运到挂载点 /buildd/out (=宿主 WORK/out)
+    echo "===== sources/out 内容 ====="
+    ls -lh /buildd/sources/out/ 2>/dev/null || true
+    cp -r /buildd/sources/out/. /buildd/out/ 2>/dev/null || true
+    echo "===== /buildd/out 内容 ====="
+    ls -lh /buildd/out/ 2>/dev/null || true
 '
 docker rm -f "$CID"
 trap - EXIT
