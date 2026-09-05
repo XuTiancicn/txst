@@ -72,7 +72,10 @@ jobs:
             || echo "WARN: 追加 swap 失败, 继续尝试编译"
           free -h
           # 日志落盘; 失败时先抓 error 上下文再 tail (make -j 并行输出会把真实错误顶出窗口)
-          make ARCH=arm64 LLVM=1 -j$(nproc) Image > build.log 2>&1 \
+          # ⚠ Ubuntu clang 18 下 5.10 的 io_uring.c io_issue_sqe 栈帧 2560B > CONFIG_FRAME_WARN=2048
+          #   + -Werror 报错 (官方 CI 用 Android prebuilt clang 帧布局不同不触发);
+          #   KCFLAGS 追加 -Wno-frame-larger-than 使该警告降级不阻断
+          make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j$(nproc) Image > build.log 2>&1 \
             || { echo "===== 编译失败: error 上下文 ====="; \
                  grep -n -E "error:|Error [0-9]+|Killed|fatal|undefined reference|No space left" build.log | head -30; \
                  echo "===== 编译失败: 末尾 40 行 ====="; tail -40 build.log; exit 1; }
