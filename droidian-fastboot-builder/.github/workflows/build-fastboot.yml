@@ -1,0 +1,96 @@
+name: Build Droidian marble fastboot image
+
+# 每次运行都会重新克隆最新的 droidian-xiaomi-marble(trixie)，
+# 把 marble 从 recovery rootfs 切换为官方推荐的 fastboot-flashable 整刷包
+# （zip 内含 data/boot.img + data/userdata.img + flash_all.sh）
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_type:
+        description: '构建类型: image=fastboot整刷包 / rootfs=recovery zip'
+        type: choice
+        default: image
+        options:
+          - image
+          - rootfs
+      branch:
+        description: 'droidian-xiaomi-marble 分支'
+        type: string
+        default: trixie
+
+permissions:
+  contents: write
+
+jobs:
+  build-fastboot-image:
+    name: marble ${{ inputs.image_type }} (trixie @ latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout builder scripts
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Register qemu-arm64 binfmt (arm64 rootfs on x86 runner)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static binfmt-support
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Build (clone latest -> patch type -> debos)
+        env:
+          IMAGE_TYPE: ${{ inputs.image_type }}
+          BRANCH: ${{ inputs.branch }}
+          VERSION: next
+        run: |
+          ./scripts/build.sh
+
+      - name: Verify flashable output
+        run: |
+          ls -lh work/out/
+          ZIP=$(ls work/out/*.zip | head -1)
+          unzip -l "$ZIP" | head -30 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidian-marble-${{ inputs.image_type }}-${{ github.run_number }}
+          path: work/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: droidian-${{ inputs.image_type }}-${{ github.run_number }}
+          name: "Droidian marble ${{ inputs.image_type }} #${{ github.run_number }}"
+          body: |
+            Droidian marble fastboot-flashable 整刷包（自动构建 @ ${{ github.sha }}）
+
+            **来源**（每次构建均克隆最新）:
+            - 构建系统: droidian-marble/droidian-xiaomi-marble @ ${{ inputs.branch }} (latest)
+            - 容器: quay.io/droidian/rootfs-builder:next-amd64 (debos)
+            - 内核: 官方 5.10.226 gki (linux-bootimage-5.10.226-xiaomi-marble)
+
+            **刷入**:
+            1. 解压 zip
+            2. 手机关机进 fastboot (音量下+电源)
+            3. `./flash_all.sh` （会清空 userdata，现有 /data/rootfs.img 与 Android 数据都会被清除）
+
+            **注意**: 官方 5.10.226 内核无 msm_drm 显示驱动，若黑屏请换带显示驱动的
+            boot.img 后单刷（见项目 README「换内核」一节）。
+          files: |
+            work/out/*.zip
+          fail_on_unmatched_files: true
+          make_latest: false
