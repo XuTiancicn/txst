@@ -61,15 +61,22 @@ jobs:
         working-directory: kernel
         run: |
           # 官方 boot.img 内核段为未压缩 Image（BOARD_KERNEL_IMAGE_NAME := Image）
-          # vendor config 全量编译内存峰值高, runner 16GB 会 OOM → 加 8G swap 兜底
+          # vendor config 全量编译内存峰值高, runner 16GB 会 OOM → 追加 swap 兜底
+          # ⚠ runner 自带 swap 文件已占用 /swapfile (fallocate 报 Text file busy),
+          #   必须换路径; 同时用 dd 兜底 fallocate 不支持的情况
           free -h
-          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
-            && sudo mkswap /swapfile && sudo swapon /swapfile
+          sudo fallocate -l 8G /mnt/swap8g 2>/dev/null \
+            || sudo dd if=/dev/zero of=/mnt/swap8g bs=1M count=8192 status=none
+          sudo chmod 600 /mnt/swap8g
+          sudo mkswap /mnt/swap8g >/dev/null 2>&1 && sudo swapon /mnt/swap8g \
+            || echo "WARN: 追加 swap 失败, 继续尝试编译"
           free -h
-          # 日志落盘, 失败时 tail 真实错误 (管道 tail 会吞掉 make 退出码)
+          # 日志落盘; 失败时先抓 error 上下文再 tail (make -j 并行输出会把真实错误顶出窗口)
           make ARCH=arm64 LLVM=1 -j$(nproc) Image > build.log 2>&1 \
-            || { echo "===== 编译失败，最后 100 行 ====="; tail -100 build.log; exit 1; }
-          tail -15 build.log
+            || { echo "===== 编译失败: error 上下文 ====="; \
+                 grep -n -E "error:|Error [0-9]+|Killed|fatal|undefined reference|No space left" build.log | head -30; \
+                 echo "===== 编译失败: 末尾 40 行 ====="; tail -40 build.log; exit 1; }
+          tail -8 build.log
           ls -lh arch/arm64/boot/Image
 
       - name: Package artifacts
