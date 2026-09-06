@@ -1,7 +1,18 @@
-name: Build Marble Kernel
+name: Build Marble Kernel (LOS + Droidian display)
 
+# =============================================================================
+# 单一 workflow / 双 job — 一次触发只产生一个 run, 并行产出两个内核:
+#   ① lineage-gki        LineageOS 23.2 (Android 16) GKI 内核
+#   ② droidian-display   Droidian 5.10.238 + DRM_MSM 显示驱动内置内核
+# 编译核心共用 scripts/compile_kernel.sh (swap 兜底/KCFLAGS/失败诊断, 单点维护)
+# =============================================================================
 on:
   workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Droidian display 内核分支 (仅手动触发生效, 默认 droidian)'
+        required: false
+        default: 'droidian'
   push:
     branches: [main, master]
 
@@ -9,8 +20,13 @@ permissions:
   contents: write
 
 jobs:
-  build-kernel:
-    name: Build marble boot.img (source kernel Image + stock container)
+  # ---------------------------------------------------------------------------
+  # ① LineageOS 23.2 GKI 内核 (push/手动 都跑)
+  #    源码: LineageOS/android_kernel_xiaomi_sm8450 @ lineage-23.2
+  #    容器: 仓库内 stock/ (官方 LOS boot 分区解包件)
+  # ---------------------------------------------------------------------------
+  lineage-gki:
+    name: LineageOS 23.2 GKI kernel
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -60,9 +76,8 @@ jobs:
       - name: Build kernel image (Image, uncompressed)
         working-directory: kernel
         run: |
-          # 编译核心抽到 scripts/compile_kernel.sh (与 Droidian display 内核任务共用, 单点维护):
-          #   ① swap 兜底: runner 自带 swap 占 /swapfile, fallocate 报 Text file busy
-          #      必须换 /mnt/swap8g + dd 兜底 (否则 16 核并行 OOM killer 杀编译)
+          # 编译核心共用 scripts/compile_kernel.sh (与 droidian-display job 同一脚本):
+          #   ① swap 兜底: runner 自带 swap 占 /swapfile, 必须换 /mnt/swap8g + dd 兜底
           #   ② KCFLAGS=-Wno-frame-larger-than: Ubuntu clang18 编 5.10 io_issue_sqe
           #      栈帧 2560B>CONFIG_FRAME_WARN=2048 报 -Werror (官方 prebuilt clang 不触发)
           #   ③ 失败诊断: 先 grep error 上下文再 tail (make -j 并行会淹没真实错误)
@@ -154,3 +169,70 @@ jobs:
             dist/gki_defconfig_used.config
           fail_on_unmatched_files: true
           make_latest: true
+
+  # ---------------------------------------------------------------------------
+  # ② Droidian display 内核 (push/手动 都跑, 手动可换 kernel_branch)
+  #    源码: droidian-marble/linux-droidian-marble @ droidian (自带 techpack/display)
+  #    做法: Kconfig 补丁接入 display 符号 -> marble_defconfig 开 DRM_MSM 系列 built-in
+  #          -> compile_kernel.sh 编译 -> 官方 5.10.238 boot.img 容器重打包
+  # ---------------------------------------------------------------------------
+  droidian-display:
+    name: Droidian 5.10.238 + DRM_MSM display kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm cpio lz4 flex bison bc \
+            libssl-dev libelf-dev kmod device-tree-compiler 2>&1 | tail -2
+          clang --version | head -1
+
+      - name: Build display kernel (Kconfig patch + DRM_MSM built-in)
+        env:
+          # push 触发无 inputs -> 回落默认 droidian
+          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'droidian' }}
+        run: |
+          chmod +x scripts/build_display_kernel.sh
+          ./scripts/build_display_kernel.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-display-kernel
+          path: |
+            dist/boot.img
+            dist/Image
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: display-kernel-${{ github.run_number }}
+          name: Droidian marble display kernel (DRM_MSM built-in)
+          body: |
+            带显示驱动的 Droidian marble 内核 boot.img (techpack/display built-in, 非模块)
+
+            **用途**: 修复官方内核线 (gki/非gki/Melt) 均无 msm_drm 导致的黑屏
+
+            **文件说明**
+            - `boot.img` — 完整可刷 boot 映像 (5.10.238 原 ramdisk + 显示驱动内置内核)
+            - `Image` — 未压缩内核 (含 DRM_MSM)
+
+            **刷入**: fastboot flash boot_a boot.img && fastboot flash boot_b boot.img
+            (或进 TWRP adb sideload 桌面的 sideload zip)
+          files: |
+            dist/boot.img
+            dist/Image
+          fail_on_unmatched_files: true
+          make_latest: false
