@@ -144,16 +144,23 @@ done
 
 echo "===== [4/6] 编译内核 Image (显示 built-in, 约 30-60 分钟) ====="
 # 编译核心抽到 compile_kernel.sh (与 LineageOS 内核任务共用, 单点维护):
-#   swap 兜底(/mnt/swap8g) + KCFLAGS=-Wno-frame-larger-than + 失败诊断
+#   swap 兜底(/mnt/swap8g) + KCFLAGS=-Wno-frame-larger-than + 失败诊断 + 心跳输出
 bash "$WORK/scripts/compile_kernel.sh" . Image
+# 注意: 此处仍在 kernel/ 目录内, Image 到根 dist/ 的复制统一放在 [5/6] cd $WORK 后
 mkdir -p dist
 cp arch/arm64/boot/Image dist/Image
+echo "kernel 内 dist/Image (验证用):"
+ls -lh dist/Image
 
 echo "===== [5/6] 下载官方 5.10.238 boot.img 容器并重打包 ====="
 cd "$WORK"
 rm -rf stock-238 dist-stock
 # 注意: 仓库根 dist/ 与 kernel/dist/ 是两个不同目录, 这里必须重建 (repack 输出落根 dist/)
 mkdir -p dist stock-238
+# 未压缩 Image 复制到根 dist/ (artifact + release 都要发; DRM_MSM 符号验证用)
+cp kernel/arch/arm64/boot/Image dist/Image
+echo "根 dist/ 产物:"
+ls -lh dist/
 curl -sL --retry 3 -o boot238.deb "$BOOTIMAGE_DEB_URL" -w "bootimage deb HTTP %{http_code} size %{size_download}\n"
 # 提取 deb 内 boot.img
 dpkg-deb -x boot238.deb dist-stock 2>/dev/null || python3 - <<'PYEOF'
