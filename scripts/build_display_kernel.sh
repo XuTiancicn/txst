@@ -155,7 +155,8 @@ done
 
 echo "===== [5/7] 编译内核 Image (显示 built-in, 约 30-60 分钟) ====="
 # 日志落盘; 失败时先抓 error 上下文再 tail (make -j 并行输出会把真实错误顶出窗口)
-make ARCH=arm64 LLVM=1 -j"$(nproc)" Image > build.log 2>&1 \
+# KCFLAGS=-Wno-frame-larger-than: Ubuntu clang 编译 5.10 内核 io_issue_sqe 栈帧 2560B>2048B 报 -Werror (官方 Android prebuilt clang 帧布局不同不触发)
+make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j"$(nproc)" Image > build.log 2>&1 \
     || { echo "===== 编译失败: error 上下文 ====="; \
          grep -n -E "error:|Error [0-9]+|Killed|fatal|undefined reference|No space left" build.log | head -40; \
          echo "===== 编译失败: 末尾 50 行 ====="; tail -50 build.log; exit 1; }
