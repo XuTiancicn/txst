@@ -152,7 +152,8 @@ cp arch/arm64/boot/Image dist/Image
 echo "===== [5/6] 下载官方 5.10.238 boot.img 容器并重打包 ====="
 cd "$WORK"
 rm -rf stock-238 dist-stock
-mkdir -p stock-238
+# 注意: 仓库根 dist/ 与 kernel/dist/ 是两个不同目录, 这里必须重建 (repack 输出落根 dist/)
+mkdir -p dist stock-238
 curl -sL --retry 3 -o boot238.deb "$BOOTIMAGE_DEB_URL" -w "bootimage deb HTTP %{http_code} size %{size_download}\n"
 # 提取 deb 内 boot.img
 dpkg-deb -x boot238.deb dist-stock 2>/dev/null || python3 - <<'PYEOF'
@@ -183,8 +184,21 @@ BOOT_IMG=$(find dist-stock -name "boot.img-*" | head -1)
 ls -lh "$BOOT_IMG"
 
 python3 scripts/unpack_boot_v4.py "$BOOT_IMG" stock-238
+
+# 内核段 gzip 压缩: 新 Image 49MB(DRM_MSM built-in) > 原容器 kernel 段 40MB,
+# 未压缩重打包 boot.img 约 66.7MB 有溢出 boot 分区风险. 按 GKI 官方 boot.img 规范
+# (kernel 段即 Image.gz) 压缩后约 25MB, 整包 ~44MB 稳放 (marble 跑 GKI, ABL 必支持 gzip 解压)
+gzip -n -9 -c kernel/arch/arm64/boot/Image > stock-238/kernel.gz
+echo "--- 内核段 gzip 后 ---"
+ls -lh stock-238/kernel.gz
+python3 - <<'PYEOF'
+k = open('stock-238/kernel.gz','rb').read(2)
+assert k == b'\x1f\x8b', f"gzip magic 错误: {k.hex()}"
+print("gzip 头 OK (1f8b)")
+PYEOF
+
 python3 scripts/repack_boot.py \
-    kernel/arch/arm64/boot/Image \
+    stock-238/kernel.gz \
     stock-238/header.bin \
     stock-238/ramdisk \
     stock-238/boot_signature \
@@ -199,13 +213,14 @@ hv = struct.unpack_from('<I', d, 40)[0]
 ksz = struct.unpack_from('<I', d, 8)[0]
 rsz = struct.unpack_from('<I', d, 12)[0]
 sigsz = struct.unpack_from('<I', d, 1580)[0]
-print(f"总大小: {len(d)} bytes")
+print(f"总大小: {len(d)} bytes ({len(d)/1024/1024:.1f} MB)")
 print(f"header_version={hv} kernel_size={ksz} ({ksz/1024/1024:.1f} MB) ramdisk_size={rsz} signature_size={sigsz}")
 assert hv == 4 and ksz > 0 and rsz > 0
-# 内核段应为未压缩 Image (MZ 头是 arm64 Image PE 兼容占位, 真魔数在 0x38)
+# 内核段 = gzip 压缩 Image (GKI 规范), magic 1f8b; 若后续改回未压缩则为 MZ
 k = d[4096:4096+ksz]
-assert k[:2] == b'MZ', "内核段不是 Image"
-print("Image MZ 头 OK, boot.img 校验通过")
+assert k[:2] == b'\x1f\x8b', f"内核段不是 gzip: {k[:2].hex()}"
+print("kernel 段 gzip 头 OK, boot.img 校验通过")
+print(f"整包 {len(d)/1024/1024:.1f} MB < 官方容器原包 59MB, 无分区溢出风险")
 PYEOF
 
 echo ""

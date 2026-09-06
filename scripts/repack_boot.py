@@ -72,6 +72,12 @@ def main() -> None:
     if signature:
         img += page_align(signature)
 
+    # 输出父目录不存在时自动创建 (两个 workflow 均调用, 防止调用方漏建目录)
+    import os
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     with open(out_path, "wb") as f:
         f.write(img)
 

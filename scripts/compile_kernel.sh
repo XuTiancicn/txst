@@ -42,9 +42,23 @@ fi
 free -h | head -2 || true
 
 echo "===== [编译] make $TARGET (LLVM=1 KCFLAGS=-Wno-frame-larger-than, -j$(nproc)) ====="
-# 日志落盘; 失败时先抓 error 上下文再 tail (make -j 并行输出会把真实错误顶出窗口)
-make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j"$(nproc)" "$TARGET" > build.log 2>&1 \
-    || { echo "===== 编译失败: error 上下文 ====="; \
+# 日志落盘 + 后台 make + 前台心跳: make -j 全量输出进 build.log (防 Actions 日志刷爆/
+# 4MB 截断), 每 45s 打印一次进度行, 控制台不再长时间静默 (心跳: 行数 + 最近一条编译行)
+make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j"$(nproc)" "$TARGET" > build.log 2>&1 &
+MPID=$!
+LAST_LINES=0
+while kill -0 "$MPID" 2>/dev/null; do
+    sleep 45
+    N=$(wc -l < build.log 2>/dev/null | tr -d ' ' || echo 0)
+    if [ "${N:-0}" -gt "$LAST_LINES" ]; then
+        L=$(tail -1 build.log | tr -d '\r' | cut -c1-150)
+        echo "[心跳 $(date +%H:%M:%S) UTC] build.log $N 行 | $L"
+        LAST_LINES=$N
+    else
+        echo "[心跳 $(date +%H:%M:%S) UTC] build.log $N 行 (无新输出, 编译进程存活)"
+    fi
+done
+wait "$MPID" || { echo "===== 编译失败: error 上下文 ====="; \
          grep -n -E "error:|Error [0-9]+|Killed|fatal|undefined reference|No space left" build.log | head -40; \
          echo "===== 编译失败: 末尾 50 行 ====="; tail -50 build.log; exit 1; }
 tail -8 build.log
