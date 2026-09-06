@@ -30,18 +30,7 @@ KERNEL_BRANCH="${KERNEL_BRANCH:-droidian}"
 # 官方 5.10.238 bootimage deb (容器: 原 header+ramdisk 与 238 内核配套)
 BOOTIMAGE_DEB_URL="${BOOTIMAGE_DEB_URL:-https://github.com/droidian-marble/linux-droidian-marble/releases/download/latest-kernel-droidian/linux-bootimage-5.10.238-xiaomi-marble_0.0.1_arm64.deb}"
 
-echo "===== [1/7] swap 兜底 (runner 自带 swap 占用 /swapfile, 换路径) ====="
-free -h | head -2 || true
-if ! swapon --show | grep -q swap8g; then
-    if [ ! -f /mnt/swap8g ]; then
-        dd if=/dev/zero of=/mnt/swap8g bs=1M count=8192 status=none || true
-    fi
-    chmod 600 /mnt/swap8g 2>/dev/null || true
-    mkswap /mnt/swap8g 2>/dev/null && swapon /mnt/swap8g 2>/dev/null || echo "WARN: swap8g 未生效, 继续"
-fi
-free -h | head -2 || true
-
-echo "===== [2/7] clone 内核源码 ($KERNEL_BRANCH) ====="
+echo "===== [1/6] clone 内核源码 ($KERNEL_BRANCH) ====="
 rm -rf kernel
 git clone --depth 1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel 2>&1 | tail -2
 cd kernel
@@ -49,7 +38,7 @@ KVER=$(make kernelversion 2>/dev/null || echo "5.10.238")
 echo "内核版本: $KVER"
 grep -c "CONFIG_DRM" arch/arm64/configs/marble_defconfig || true
 
-echo "===== [3/7] Kconfig 补丁: 接入 display 符号 ====="
+echo "===== [2/6] Kconfig 补丁: 接入 display 符号 ====="
 # 3a. 新建 techpack/display/Kconfig 定义显示符号 (bool, 默认 y)
 cat > techpack/display/Kconfig <<'KEOF'
 menu "QCOM Display Drivers (techpack/display)"
@@ -126,7 +115,7 @@ fi
 echo "--- techpack/Kconfig 补丁后 ---"
 grep -n "source" techpack/Kconfig
 
-echo "===== [4/7] 生成 .config + 开启显示符号 ====="
+echo "===== [3/6] 生成 .config + 开启显示符号 ====="
 make ARCH=arm64 marble_defconfig > /dev/null 2>&1 || { echo "marble_defconfig 失败"; exit 1; }
 
 # 用 scripts/config 打开显示符号 (符号经 Kconfig 补丁定义, olddefconfig 不会被清)
@@ -153,19 +142,14 @@ for s in CONFIG_DRM_MSM CONFIG_DRM_MSM_SDE CONFIG_DRM_MSM_DSI; do
     grep -q "^${s}=y" .config && echo "OK  ${s}=y" || echo "MISS ${s} 未生效!"
 done
 
-echo "===== [5/7] 编译内核 Image (显示 built-in, 约 30-60 分钟) ====="
-# 日志落盘; 失败时先抓 error 上下文再 tail (make -j 并行输出会把真实错误顶出窗口)
-# KCFLAGS=-Wno-frame-larger-than: Ubuntu clang 编译 5.10 内核 io_issue_sqe 栈帧 2560B>2048B 报 -Werror (官方 Android prebuilt clang 帧布局不同不触发)
-make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j"$(nproc)" Image > build.log 2>&1 \
-    || { echo "===== 编译失败: error 上下文 ====="; \
-         grep -n -E "error:|Error [0-9]+|Killed|fatal|undefined reference|No space left" build.log | head -40; \
-         echo "===== 编译失败: 末尾 50 行 ====="; tail -50 build.log; exit 1; }
-tail -5 build.log
-ls -lh arch/arm64/boot/Image
+echo "===== [4/6] 编译内核 Image (显示 built-in, 约 30-60 分钟) ====="
+# 编译核心抽到 compile_kernel.sh (与 LineageOS 内核任务共用, 单点维护):
+#   swap 兜底(/mnt/swap8g) + KCFLAGS=-Wno-frame-larger-than + 失败诊断
+bash "$WORK/scripts/compile_kernel.sh" . Image
 mkdir -p dist
 cp arch/arm64/boot/Image dist/Image
 
-echo "===== [6/7] 下载官方 5.10.238 boot.img 容器并重打包 ====="
+echo "===== [5/6] 下载官方 5.10.238 boot.img 容器并重打包 ====="
 cd "$WORK"
 rm -rf stock-238 dist-stock
 mkdir -p stock-238
@@ -206,7 +190,7 @@ python3 scripts/repack_boot.py \
     stock-238/boot_signature \
     dist/boot.img
 
-echo "===== [7/7] 校验最终 boot.img ====="
+echo "===== [6/6] 校验最终 boot.img ====="
 python3 - <<'PYEOF'
 import struct
 d = open('dist/boot.img','rb').read()
