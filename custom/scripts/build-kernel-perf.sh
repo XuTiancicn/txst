@@ -11,7 +11,9 @@
 # 产物：dist/boot.img（官方 5.10.238 容器 + 本内核）、dist/Image、dist/used.config
 #
 # 依赖：与 scripts/build_display_kernel.sh 相同的工具链（Actions ubuntu 已装）
-# 用法：KERNEL_BRANCH=droidian ./custom/scripts/build-kernel-perf.sh
+# 用法：KERNEL_BRANCH=auto ./custom/scripts/build-kernel-perf.sh
+#       （auto = 依次试 droidian-old / droidian / android12-5.10-2025-05，
+#         取第一个含 arch/arm64/configs/marble_defconfig 的分支）
 # =============================================================================
 set -euo pipefail
 
@@ -28,11 +30,31 @@ die() { echo "E: $*" >&2; exit 1; }
 cd "$ROOT"
 rm -rf kernel dist stock-238 dist-stock boot238.deb
 
-echo "===== [1/7] clone 内核源码 @ $KERNEL_BRANCH ====="
-git clone --depth 1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel 2>&1 | tail -2
+echo "===== [1/7] clone 内核源码（自动挑分支 / defconfig） ====="
+# ★ 仓库 droidian-marble/linux-droidian-marble-gki 是从 linux-droidian-marble 改名来的。
+#   改名后 droidian 分支变成 GKI 树（只有 gki_defconfig + vendor/*_GKI.config），
+#   老的「marble_defconfig + techpack/display」树留在 droidian-old 分支。
+#   所以按候选顺序探测，取第一个真有 marble_defconfig 的分支。
+CAND="$KERNEL_BRANCH"
+[ "$CAND" = "auto" ] && CAND="droidian-old droidian android12-5.10-2025-05"
+DEFCONFIG=""
+for b in $CAND; do
+    echo "--- 试分支 $b ---"
+    rm -rf kernel
+    if ! git clone --quiet --depth 1 --branch "$b" "$KERNEL_REPO" kernel >/dev/null 2>&1; then
+        echo "  clone 失败，跳过"; continue
+    fi
+    for c in marble_defconfig vendor/marble_defconfig; do
+        if [ -f "kernel/arch/arm64/configs/$c" ]; then DEFCONFIG="$c"; KERNEL_BRANCH="$b"; break; fi
+    done
+    [ -n "$DEFCONFIG" ] && break
+    echo "  该分支没有 marble_defconfig"
+done
+[ -n "$DEFCONFIG" ] || die "候选分支都没有 marble defconfig（试过: $CAND）"
+echo "★ 采用: 分支=$KERNEL_BRANCH  defconfig=$DEFCONFIG"
 cd kernel
 echo "kernelversion: $(make kernelversion 2>/dev/null)"
-ls arch/arm64/configs/ | grep -i marble || die "找不到 marble defconfig"
+[ -d techpack/display ] || die "本分支($KERNEL_BRANCH)无 techpack/display，无法内置显示驱动"
 
 echo "===== [2/7] 接入显示驱动符号（与上游流程一致） ====="
 cat > techpack/display/Kconfig <<'KEOF'
@@ -81,7 +103,7 @@ grep -q 'display/Kconfig' techpack/Kconfig || \
     sed -i '/source "techpack\/datarmnet\/core\/Kconfig"/i source "techpack/display/Kconfig"' techpack/Kconfig
 
 echo "===== [3/7] marble_defconfig + 显示符号 ====="
-make ARCH=arm64 marble_defconfig >/dev/null 2>&1 || die "marble_defconfig 失败"
+make ARCH=arm64 "$DEFCONFIG" >/dev/null 2>&1 || die "$DEFCONFIG 失败"
 scripts/config \
     --enable DRM_MSM --enable DRM_MSM_SDE --enable DRM_MSM_DSI \
     --enable DRM_SDE_RSC --enable DSI_PARSER \

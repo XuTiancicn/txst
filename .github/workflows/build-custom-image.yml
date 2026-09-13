@@ -182,12 +182,20 @@ jobs:
         run: |
           set -o pipefail
           SRC="$PWD/work-src-${EDITION}"
+          # ★ 设备仓库在 $SRC/src（prepare-image.sh 克隆到这里），不是 $SRC 本身。
+          #   挂错层级会让容器里 ./generate_device_recipe.py: not found（上次 rc=127 的原因）。
+          DSRC="$SRC/src"
           mkdir -p "$SRC/out"
+          if [ ! -f "$DSRC/generate_device_recipe.py" ]; then
+            echo "::error::$DSRC 下没有 generate_device_recipe.py"
+            ls -la "$SRC" "$DSRC" 2>/dev/null || true
+            exit 1
+          fi
           CID=$(docker run --detach --privileged --cgroupns=host \
                   -v "$SRC/out:/buildd/out" \
                   -v /dev:/host-dev \
                   -v /sys/fs/cgroup:/sys/fs/cgroup \
-                  -v "$SRC:/buildd/sources" \
+                  -v "$DSRC:/buildd/sources" \
                   --security-opt seccomp:unconfined \
                   quay.io/droidian/rootfs-builder:next-arm64 sleep infinity)
           trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
@@ -277,6 +285,10 @@ jobs:
     runs-on: ubuntu-24.04
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_kernel }}
     timeout-minutes: 180
+    # 内核是「附加产物」：Linux 侧默认 governor=performance 已由 rootfs 里的
+    # droidian-perf.sh + 保活 timer 完成，不依赖本 job。
+    # 故本 job 失败不拖累整刷包（失败日志仍会发到 Release tag debug-kernel-*）。
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -297,7 +309,9 @@ jobs:
           set -o pipefail
           chmod +x custom/scripts/build-kernel-perf.sh
           set +e
-          KERNEL_BRANCH="${DEV_BRANCH}" \
+          # auto = 依次试 droidian-old / droidian / android12-5.10-2025-05，
+          #        取第一个含 arch/arm64/configs/marble_defconfig 的分支
+          KERNEL_BRANCH="auto" \
             bash -x ./custom/scripts/build-kernel-perf.sh > kernel-build.log 2>&1
           rc=$?
           set -e
