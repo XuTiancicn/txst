@@ -90,9 +90,16 @@ EDITION = sys.argv[1]
 #   这种基础包都会一起被列进 "not going to be installed"（日志极具误导性）。
 #   已实测炸过一次：
 #     E: Unable to satisfy dependencies. Reached two conflicting assignments:
-#        chrony is selected for install / systemd-timesyncd Conflicts time-daemon
-#   ⇒ 时间同步**只能留一个**。保留 systemd-timesyncd（base 自带），
-#     因此这里必须**不含 chrony**；也去掉 ufw（会拉 ucf，收益低风险高）。
+#        chrony is selected for install / systemd-timesyncd Conflicts: time-daemon
+#
+#   ★ 关键：chrony 不是我们加的，是**上游默认**就装的（debos 日志里能看到
+#     "Creating user '_chrony'" 与 "Setting up chrony"，上游 community_devices.yml
+#     的包列表里也有它）。所以时间同步**已经由 chrony 提供**，
+#     这里绝不能再列 chrony / systemd-timesyncd / any time-daemon 提供者。
+#   ★ 另注意：本列表会与上游列表**合并成同一个 apt 事务**整体求解，
+#     任何一对 Provides/Conflicts 打起来，apt 就把整批包（连 openssh-common、
+#     python3、git 这些无关的）一起列进 "not going to be installed" —— 极具误导性，
+#     定位时必须一路往日志下面看到最后那句 "E: Unable to satisfy dependencies"。
 SERVER_PKGS = [
     # OpenSSH（"允许 ssh 连接，使用 OpenSSH"）
     "openssh-server", "openssh-client",
@@ -102,8 +109,7 @@ SERVER_PKGS = [
     "procps", "psmisc", "htop", "lsof", "strace", "tmux", "screen",
     "net-tools", "iproute2", "iputils-ping", "dnsutils", "traceroute",
     "netcat-openbsd", "rsync", "git", "jq",
-    # 时间同步：只留 systemd-timesyncd（★ 绝不并列 chrony，二者硬冲突）
-    "systemd-timesyncd",
+    # ★ 时间同步：不列！上游已装 chrony（列 systemd-timesyncd 会硬冲突）
     "iptables", "nftables",
     "cron", "logrotate",
     "python3", "python3-pip", "python3-venv",
