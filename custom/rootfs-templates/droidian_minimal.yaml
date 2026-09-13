@@ -85,7 +85,12 @@ actions:
       - git
       - jq
       # --- 服务 / 运维 ---
-      - systemd-timesyncd
+      # ★ 时间同步：只留 chrony（上游 base 已经装了它，日志里能看到
+      #   "Creating user '_chrony'"）。**绝不能并列 systemd-timesyncd** ——
+      #   它 `Conflicts: time-daemon` 而 chrony `Provides: time-daemon`，
+      #   同一条 apt 事务里出现两个 time-daemon 提供者会让 apt 判整个请求
+      #   不可满足（报 "Reached two conflicting assignments"），并把 openssh /
+      #   python3 / git 等一大批无关包一起列进 "not going to be installed"。
       - chrony
       - iptables
       - nftables
@@ -103,7 +108,8 @@ actions:
     description: enable ssh + timesync (systemd in chroot, no start)
     command: |
       systemctl enable ssh.service  || systemctl enable sshd.service || true
-      systemctl enable systemd-timesyncd.service || true
+      # 时间同步用 chrony（本 edition 装的就是它，没有 systemd-timesyncd）
+      systemctl enable chrony.service 2>/dev/null || true
 
   # ★无桌面版没有屏幕，唯一可靠的接入通道就是网络。
   #   droidian_gsi_base.yaml 里的 setup-gsi.sh 会主动 disable mobian-usb-gadget
