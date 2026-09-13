@@ -1,0 +1,10 @@
+[Unit]
+Description=marble: re-assert max performance (cpufreq only, idempotent)
+Documentation=https://github.com/XuTiancicn/txst
+# Android 容器起来之后才可能有人回写 governor，必须在其后
+After=lxc@android.service droidian_boot_completed.service
+Requires=lxc@android.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/droidian-perf.sh --freq-only

@@ -1,0 +1,122 @@
+{{- $architecture := or .architecture "arm64" -}}
+{{- $apilevel := or .apilevel "32" -}}
+{{- $suite := "trixie" -}}
+{{- $version := or .version "next" -}}
+{{- $variant := or .variant "phone" -}}
+{{- $use_internal_repository := or .use_internal_repository "no" -}}
+{{- $droidian_version := or .droidian_version "current" -}}
+{{- $droidian_variant := or .droidian_variant "" -}}
+
+{{- $username := or .username "droidian" -}}
+{{- $password := or .password "1234" -}}
+{{- $hostname := or .hostname "droidian" -}}
+
+# =============================================================================
+# droidian_minimal.yaml —— 无桌面（headless server）edition
+#
+# 作用：让 "桌面环境为可选项" 在源码层面成立。
+#   device.yaml 会按 $edition 去 include "droidian_<edition>.yaml"，
+#   因此本文件 = 一个新 edition：不装任何 GUI（无 phosh / 无 cutie），
+#   直接落到 multi-user.target，只靠 OpenSSH 远程接入。
+#
+# 与 droidian_phosh.yaml 的唯一实质差别：不装 droidian-phosh-* 与
+# droidian-phosh-full，改为装一组 Linux server 常用组件。
+#
+# 接入方式（无屏可用）：
+#   · USB：Droidian 的 mobian-usb-gadget 提供 RNDIS 网卡（见 prepare 脚本会重新 enable）
+#   · WiFi：容器起来后 nmcli 配网
+#   · 默认账号：droidian / 1234
+# =============================================================================
+architecture: {{ $architecture }}
+actions:
+
+  - action: recipe
+    description: create rootfs (base + android GSI + user/system setup)
+    recipe: droidian_gsi_base.yaml
+    variables:
+      architecture: {{ $architecture }}
+      apilevel: {{ $apilevel }}
+      suite: {{ $suite }}
+      use_internal_repository: {{ $use_internal_repository }}
+      droidian_version: {{ $droidian_version }}
+      droidian_variant: {{ $droidian_variant }}
+      username: {{ $username }}
+      password: {{ $password }}
+      hostname: {{ $hostname }}
+
+  - action: apt
+    chroot: true
+    description: install linux server essentials (OpenSSH + 常用服务)
+    packages:
+      # --- 远程接入 ---
+      - openssh-server
+      - openssh-client
+      # --- 基础工具 ---
+      - sudo
+      - ca-certificates
+      - curl
+      - wget
+      - gnupg
+      - unzip
+      - zip
+      - tar
+      - less
+      - vim-tiny
+      - nano
+      - file
+      - findutils
+      - bash-completion
+      - man-db
+      # --- 进程 / 网络诊断 ---
+      - procps
+      - psmisc
+      - htop
+      - lsof
+      - strace
+      - tmux
+      - screen
+      - net-tools
+      - iproute2
+      - iputils-ping
+      - dnsutils
+      - traceroute
+      - netcat-openbsd
+      - rsync
+      - git
+      - jq
+      # --- 服务 / 运维 ---
+      - systemd-timesyncd
+      - chrony
+      - iptables
+      - nftables
+      - ufw
+      - cron
+      - logrotate
+      - zram-tools
+      # --- 运行时 ---
+      - python3
+      - python3-pip
+      - python3-venv
+
+  - action: run
+    chroot: true
+    description: enable ssh + timesync (systemd in chroot, no start)
+    command: |
+      systemctl enable ssh.service  || systemctl enable sshd.service || true
+      systemctl enable systemd-timesyncd.service || true
+
+  # ★无桌面版没有屏幕，唯一可靠的接入通道就是网络。
+  #   droidian_gsi_base.yaml 里的 setup-gsi.sh 会主动 disable mobian-usb-gadget
+  #   （那是为了给 GUI 版省掉 MTP 冲突），headless 版必须把它收回来，
+  #   否则开机后既没屏也没 USB 网卡，只能靠 WiFi 盲连。
+  - action: run
+    chroot: true
+    description: re-enable USB gadget networking (headless 唯一网口)
+    command: |
+      systemctl enable mobian-usb-gadget 2>/dev/null || true
+      systemctl enable NetworkManager.service 2>/dev/null || true
+
+  - action: run
+    chroot: true
+    description: clean droidian-minimal
+    script: scripts/clean.sh

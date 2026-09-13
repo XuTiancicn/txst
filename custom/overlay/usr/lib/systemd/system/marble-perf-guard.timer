@@ -1,0 +1,10 @@
+[Unit]
+Description=marble: periodic max-performance guard (cpufreq re-assert)
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,263 @@
+name: Build custom Droidian marble image (perf-max / SSH / DE optional)
+
+# =============================================================================
+# 一次触发，产出用户要的"定制 Droidian"：
+#   ① adaptation  —— 源码级改上游设备适配包（调速器/温控/服务），编成 deb
+#   ② image       —— 把 deb 注入内部 apt 源 + 改 community_devices.yml +
+#                    drop-in 无桌面 edition，debos 出 fastboot 直刷整刷包
+#   ③ kernel      —— 性能解锁内核（默认 performance governor + 拆降频温控）→ boot.img
+#
+# 全流程在 CI 里跑，本地零依赖、零大文件。
+# 源码级改动点见 custom/README.md
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      editions:
+        description: '桌面环境（可选项：phosh=有桌面 / minimal=纯服务端无桌面 / both）'
+        type: choice
+        default: both
+        options:
+          - both
+          - phosh
+          - minimal
+      build_kernel:
+        description: '同时构建性能解锁内核 (boot.img)'
+        type: boolean
+        default: true
+      dev_branch:
+        description: 'droidian-xiaomi-marble 分支（必须是 droidian，trixie 无 marble）'
+        type: string
+        default: droidian
+
+permissions:
+  contents: write
+
+env:
+  DEV_BRANCH: ${{ inputs.dev_branch }}
+  DROIDIAN_VERSION: next
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. 解析要构建的 edition 列表
+  # ---------------------------------------------------------------------------
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      editions: ${{ steps.gen.outputs.editions }}
+    steps:
+      - id: gen
+        run: |
+          case "${{ inputs.editions }}" in
+            both) E='["phosh","minimal"]' ;;
+            *)    E='["${{ inputs.editions }}"]' ;;
+          esac
+          echo "editions=$E" >> $GITHUB_OUTPUT
+          echo "将构建: $E"
+
+  # ---------------------------------------------------------------------------
+  # 1. 定制 adaptation 包（Architecture: all，amd64 上编即可）
+  # ---------------------------------------------------------------------------
+  adaptation:
+    name: build custom adaptation deb
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: 依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debhelper devscripts fakeroot
+      - name: 编定制 adaptation deb
+        run: |
+          chmod +x custom/scripts/build-adaptation-deb.sh
+          WORK="$PWD/work-adapt" OUT="$PWD/out-adapt" ./custom/scripts/build-adaptation-deb.sh
+      - name: 校验 deb 内容（确认改动真的进包了）
+        run: |
+          set -x
+          DEB=$(ls out-adapt/*.deb | head -1)
+          dpkg-deb -I "$DEB" | head -20
+          echo "==== 包内关键文件 ===="
+          dpkg-deb -c "$DEB" | grep -E 'droidian-perf|perf-guard|thermal-engine|thermal-normal' || true
+          T=$(mktemp -d); dpkg-deb -x "$DEB" "$T"
+          echo "==== 包内 droidian-perf.sh 关键行 ===="
+          grep -n 'performance\|pkill\|ctl.stop' "$T/usr/bin/droidian-perf.sh" | head
+          echo "==== 中立化后的温控 conf ===="
+          head -3 "$T/usr/lib/droid-vendor-overlay/etc/thermal-engine.conf"
+          echo "==== debian/rules 是否带上新 unit ===="
+          dpkg-deb -e "$DEB" "$T/DEBIAN"
+          ls "$T/DEBIAN"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: custom-adaptation-debs
+          path: out-adapt/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. 出整刷包（每个 edition 一个 job）
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (${{ matrix.edition }})
+    runs-on: ubuntu-24.04-arm
+    needs: [matrix, adaptation]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: ${{ fromJson(needs.matrix.outputs.editions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾空间（runner 根分区很小，debos 要建 loop/LVM）
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
+                      /usr/share/swift /usr/local/share/boost 2>/dev/null || true
+          df -h / | tail -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: custom-adaptation-debs
+          path: out-adapt
+
+      - name: 依赖（apt-ftparchive 生成内部源索引）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils
+
+      - name: 准备镜像配方（源码级改造）
+        run: |
+          chmod +x custom/scripts/prepare-image.sh
+          WORK="$PWD/work-src-${EDITION}" EDITION="${EDITION}" DEBS="$PWD/out-adapt" \
+            ./custom/scripts/prepare-image.sh
+        env:
+          EDITION: ${{ matrix.edition }}
+
+      - name: debos 构建（官方 rootfs-builder 容器，arm64 原生）
+        run: |
+          SRC="$PWD/work-src-${EDITION}"
+          mkdir -p "$SRC/out"
+          CID=$(docker run --detach --privileged --cgroupns=host \
+                  -v "$SRC/out:/buildd/out" \
+                  -v /dev:/host-dev \
+                  -v /sys/fs/cgroup:/sys/fs/cgroup \
+                  -v "$SRC:/buildd/sources" \
+                  --security-opt seccomp:unconfined \
+                  quay.io/droidian/rootfs-builder:next-arm64 sleep infinity)
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          docker exec "$CID" /bin/sh -c '
+            set -ex
+            cd /buildd/sources
+            export DROIDIAN_VERSION="'"$DROIDIAN_VERSION"'"
+            ./generate_device_recipe.py xiaomi_marble arm64 "'"${EDITION}"'" phone 32 ""
+            echo "===== generated/droidian.yaml ====="; cat generated/droidian.yaml
+            debos --disable-fakemachine generated/droidian.yaml
+            cp -r /buildd/sources/out/. /buildd/out/ 2>/dev/null || true
+            ls -lh /buildd/out/
+          '
+        env:
+          EDITION: ${{ matrix.edition }}
+
+      - name: 产物确认
+        run: |
+          ls -lh "work-src-${EDITION}/out/"
+          ZIP=$(ls "work-src-${EDITION}"/out/*.zip | head -1)
+          unzip -l "$ZIP" | head -25
+        env:
+          EDITION: ${{ matrix.edition }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: droidian-marble-custom-${{ matrix.edition }}-${{ github.run_number }}
+          path: work-src-${{ matrix.edition }}/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: droidian-custom-${{ matrix.edition }}-${{ github.run_number }}
+          name: "Droidian marble 定制版 [${{ matrix.edition }}] #${{ github.run_number }}"
+          body: |
+            Droidian marble 定制整刷包（edition = `${{ matrix.edition }}`）
+
+            **本包相对上游的改动（全部在源码层面）**
+            - cpufreq 默认/保活 = `performance`（开机 oneshot + 60s 幂等保活 timer）
+            - 中立化 vendor `thermal-engine.conf` / `thermal-normal.conf`，并停掉
+              Android 侧温控守护（`ctl.stop` + 兜底 pkill）→ 去掉 CPU 降频
+            - 解开 `core_ctl` / devfreq `boost_freq` 等性能旋钮
+            - 安装并开机启用 **OpenSSH**（默认账号 `droidian` / `1234`）
+            - 补充 Linux server 常用组件（见 `custom/scripts/prepare-image.sh`）
+            - `edition=minimal` 为**无桌面纯服务端**（无 phosh），靠 SSH 接入
+
+            **安全边界（故意没动）**
+            - 充电热保护 `thermal-chg-only.conf`
+            - 内核 DTS critical trip（约 115℃ 硬件级紧急关机）
+
+            **刷入**：解压 zip → 手机关机进 fastboot → `./flash_all.sh`
+            （会清空 userdata）
+
+            **配合内核**：如需内核侧默认 governor=performance，再刷 `kernel` job 产出的 boot.img
+          files: work-src-${{ matrix.edition }}/out/*
+          fail_on_unmatched_files: true
+          make_latest: false
+
+  # ---------------------------------------------------------------------------
+  # 3. 性能解锁内核
+  # ---------------------------------------------------------------------------
+  kernel:
+    name: perf-unlocked kernel
+    runs-on: ubuntu-24.04
+    if: ${{ inputs.build_kernel }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾空间
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: 工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm cpio lz4 flex bison bc \
+            libssl-dev libelf-dev kmod device-tree-compiler dpkg
+          clang --version | head -1
+
+      - name: 编性能解锁内核
+        run: |
+          chmod +x custom/scripts/build-kernel-perf.sh
+          KERNEL_BRANCH="${DEV_BRANCH}" ./custom/scripts/build-kernel-perf.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel-perf
+          path: |
+            dist/boot.img
+            dist/Image
+            dist/used.config
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-perf-${{ github.run_number }}
+          name: "Marble 性能解锁内核 #${{ github.run_number }}"
+          body: |
+            Droidian marble 内核（性能解锁版）
+
+            - 默认 cpufreq governor = `performance`（内核侧，用户态无关）
+            - 关闭降频类 thermal governor；尝试关闭 LMH / core_ctl / mi_* 等钳制旋钮
+            - 含 DRM_MSM 显示驱动（built-in，修黑屏）
+            - 容器：官方 5.10.238 boot.img（原 ramdisk + 原签名）
+            - 生效符号以构建日志「解锁项最终取值」段为准
+
+            **刷入**：`fastboot flash boot_a dist/boot.img && fastboot flash boot_b dist/boot.img`
+          files: |
+            dist/boot.img
+            dist/Image
+            dist/used.config
+          fail_on_unmatched_files: true
+          make_latest: false

@@ -1,0 +1,73 @@
+# =============================================================================
+# perf.fragment —— marble (SM7475 / waipio) 内核"解锁性能"配置片段
+#
+# 用法（在 build-custom-image.yml 的 kernel job 里）：
+#   make ARCH=arm64 marble_defconfig
+#   ./scripts/config --file .config <下面这些开关>
+#   make ARCH=arm64 olddefconfig
+#
+# 设计说明（为什么用 scripts/config 而不是 merge_config）：
+#   CPUFREQ 默认 governor / THERMAL 默认 governor 都是 Kconfig **choice**，
+#   同一条 choice 里两个 =y 会打架。scripts/config 是"最后一次写生效"，
+#   比 merge_config 的告警语义更可控。未知符号 scripts/config 只告警不报错。
+#
+# ⚠ 符号名随内核线不同会有差异（本仓是 droidian-marble/linux-droidian-marble-gki）。
+#   构建日志里会打印每个符号的最终取值，以日志为准；缺失的符号说明该线没有它。
+# =============================================================================
+
+# ---------------------------------------------------------------- A. 调速器
+# 默认 governor = performance（"Linux 调速器默认改最高性能"的内核侧实现）
+--enable  CPU_FREQ_GOV_PERFORMANCE
+--enable  CPU_FREQ_DEFAULT_GOV_PERFORMANCE
+--disable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+--disable CPU_FREQ_DEFAULT_GOV_ONDEMAND
+--disable CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
+--disable CPU_FREQ_DEFAULT_GOV_POWERSAVE
+--disable CPU_FREQ_DEFAULT_GOV_INTERACTIVE
+# 保留 walt 但不当默认（marble 的 vendor 线默认是 walt/schedutil）
+--disable CPU_FREQ_DEFAULT_GOV_WALT
+--disable CPU_BOOST
+--disable CPU_FREQ_GOV_WALT
+
+# ---------------------------------------------------- B. 温控：只拆降频，不拆保命
+# 保留 THERMAL 框架与 tsens 读温（传感器还在），只关掉"降频类" governor，
+# 使 thermal zone 即使有 trip 也没有可用的降温手段。
+--disable THERMAL_GOV_STEP_WISE
+--disable THERMAL_GOV_POWER_ALLOCATOR
+--disable THERMAL_GOV_BANG_BANG
+--disable THERMAL_GOV_USER_SPACE
+--disable THERMAL_DEFAULT_GOV_STEP_WISE
+--disable THERMAL_DEFAULT_GOV_POWER_ALLOCATOR
+--disable THERMAL_DEFAULT_GOV_BANG_BANG
+--disable THERMAL_DEFAULT_GOV_USER_SPACE
+
+# ------------------------------------------------- C. 会钳 CPU 的 vendor 旋钮
+# 逐个尝试关闭；不存在则告警（不同内核线命名不同）
+--disable QTI_THERMAL_LMHC
+--disable QTI_LMH
+--disable MSM_LMH_DCVS
+--disable MSM_THERMAL
+--disable MSM_PERFORMANCE
+--disable QCOM_CPU_VENDOR_HOOKS
+--disable QCOM_CPUFREQ_HW
+--disable MSM_CPU_FREQ_HW
+--disable CPU_FREQ_MSM
+--disable SCHED_WALT
+--disable SCHED_AUTOGROUP
+--disable QCOM_RPMH
+--disable MSM_KGSL_PER_PROCESS_PAGE
+--disable DEVFREQ_GOV_SIMPLE_ONDEMAND
+--disable DEVFREQ_GOV_QCOM_BW_HWMON
+--disable QCOM_BUS_SCALING
+--disable MSM_BUS_SCALING
+--disable QTI_BUS_DCVS
+--disable MSM_CORE_CTL
+--disable CORE_CTL
+--disable MSM_CPUFREQ_GOV
+--disable QTI_CPUFREQ_GOV
+--disable MI_FREQWDG
+--disable XIAOMI_FREQWDG
+--disable MI_MIGT
+--disable MI_METIS
+--disable MIGT
+--disable METIS
