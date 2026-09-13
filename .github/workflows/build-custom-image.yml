@@ -29,6 +29,12 @@ on:
         description: 'droidian-xiaomi-marble 分支（必须是 droidian，trixie 无 marble）'
         type: string
         default: droidian
+  # ★推本分支上任何 custom/ 改动即自动构建一遍（无需 PAT、无需手点 Run workflow）
+  push:
+    branches: [custom-perf]
+    paths:
+      - 'custom/**'
+      - '.github/workflows/build-custom-image.yml'
 
 permissions:
   contents: write
