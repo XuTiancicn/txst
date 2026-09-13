@@ -85,6 +85,14 @@ python3 - "$EDITION" <<'PYEOF'
 import io, re, sys
 
 EDITION = sys.argv[1]
+# ★ 这些包会被 debos 的 apt 动作**当成一个事务整体求解** —— 只要有一对
+#   Provides/Conflicts 打起来，apt 就判定"整个请求不可满足"，连 openssh-common
+#   这种基础包都会一起被列进 "not going to be installed"（日志极具误导性）。
+#   已实测炸过一次：
+#     E: Unable to satisfy dependencies. Reached two conflicting assignments:
+#        chrony is selected for install / systemd-timesyncd Conflicts time-daemon
+#   ⇒ 时间同步**只能留一个**。保留 systemd-timesyncd（base 自带），
+#     因此这里必须**不含 chrony**；也去掉 ufw（会拉 ucf，收益低风险高）。
 SERVER_PKGS = [
     # OpenSSH（"允许 ssh 连接，使用 OpenSSH"）
     "openssh-server", "openssh-client",
@@ -94,7 +102,9 @@ SERVER_PKGS = [
     "procps", "psmisc", "htop", "lsof", "strace", "tmux", "screen",
     "net-tools", "iproute2", "iputils-ping", "dnsutils", "traceroute",
     "netcat-openbsd", "rsync", "git", "jq",
-    "systemd-timesyncd", "chrony", "iptables", "nftables", "ufw",
+    # 时间同步：只留 systemd-timesyncd（★ 绝不并列 chrony，二者硬冲突）
+    "systemd-timesyncd",
+    "iptables", "nftables",
     "cron", "logrotate",
     "python3", "python3-pip", "python3-venv",
 ]

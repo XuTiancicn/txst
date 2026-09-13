@@ -24,9 +24,9 @@ on:
           - phosh
           - minimal
       build_kernel:
-        description: '同时构建性能解锁内核 (boot.img)'
+        description: '同时构建性能解锁内核 (boot.img | 默认关：上游内核树已无 marble defconfig)'
         type: boolean
-        default: true
+        default: false
       dev_branch:
         description: 'droidian-xiaomi-marble 分支（必须是 droidian，trixie 无 marble）'
         type: string
@@ -283,11 +283,16 @@ jobs:
   kernel:
     name: perf-unlocked kernel
     runs-on: ubuntu-24.04
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_kernel }}
+    # ★ 默认关闭（手动 trigger 时勾 build_kernel 才跑）。
+    #   原因：上游内核仓库 droidian-marble/linux-droidian-marble 改名成
+    #   linux-droidian-marble-gki 后，droidian / droidian-old /
+    #   android12-5.10-2025-05 三条分支**都没有 arch/arm64/configs/marble_defconfig**，
+    #   旧的「非 GKI + techpack/display」树已不复存在。
+    #   而 Linux 侧"调速器=最高性能"本来就由 rootfs 里的 droidian-perf.sh +
+    #   保活 timer 保证，不依赖自编内核 ⇒ 没必要每次烧 40+ 分钟 CI。
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_kernel }}
     timeout-minutes: 180
-    # 内核是「附加产物」：Linux 侧默认 governor=performance 已由 rootfs 里的
-    # droidian-perf.sh + 保活 timer 完成，不依赖本 job。
-    # 故本 job 失败不拖累整刷包（失败日志仍会发到 Release tag debug-kernel-*）。
+    # 内核是附加产物，失败不拖累整刷包（失败日志仍会发到 Release tag debug-kernel-*）
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
