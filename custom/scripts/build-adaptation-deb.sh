@@ -29,9 +29,21 @@ cd "$WORK"
 
 # ---------------------------------------------------------------- 0. 依赖
 export DEBIAN_FRONTEND=noninteractive
+# CI 里 job 可能跑在 root 容器（无 sudo），本地则需 sudo —— 两者都要能用
+if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+apt_get() { $SUDO apt-get "$@"; }
 need_pkgs=""
-for c in dpkg-buildpackage dh; do command -v "$c" >/dev/null || need_pkgs="$need_pkgs debhelper"; done
-[ -n "$need_pkgs" ] && { sudo apt-get update -qq; sudo apt-get install -y -qq $need_pkgs; }
+for c in dpkg-buildpackage dh mk-build-deps; do
+    command -v "$c" >/dev/null || need_pkgs="$need_pkgs equivs"
+done
+for c in dpkg-buildpackage dh; do
+    command -v "$c" >/dev/null || need_pkgs="$need_pkgs debhelper"
+done
+if [ -n "$need_pkgs" ]; then
+    log "缺少工具($need_pkgs)，尝试安装"
+    apt_get update -qq || true
+    apt_get install -y -qq --allow-downgrades $need_pkgs || die "基础工具装不上：$need_pkgs"
+fi
 
 # ---------------------------------------------------------------- 1. 取源码
 log "== clone $ADAPT_REPO @ $ADAPT_BRANCH =="
@@ -41,6 +53,29 @@ git config --global --get https.proxy >/dev/null 2>&1 && git config --global --u
 git clone --depth 1 --branch "$ADAPT_BRANCH" "$ADAPT_REPO" adapt
 cd adapt
 echo "上游 HEAD: $(git rev-parse --short HEAD)  $(git log -1 --pretty=%s)"
+
+# ------------------------------------------- 1.5 构建依赖（对齐上游 CI 做法）
+# 上游 CI 用 mk-build-deps 把 debian/control 的 Build-Depends 装齐后再编；
+# 缺依赖会让 dpkg-buildpackage 秒退（这正是首次失败最可能的原因）。
+log "== 检查 Build-Depends =="
+cat debian/control | sed -n '/^Build-Depends/,/^[A-Z]/p'
+if dpkg-checkbuilddeps 2>dep.err; then
+    log "构建依赖已满足"
+else
+    log "构建依赖未满足："; cat dep.err
+    if command -v mk-build-deps >/dev/null; then
+        log "用 mk-build-deps 安装（上游 CI 同款）"
+        apt_get update -qq || true
+        mk-build-deps --install \
+            --tool="apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends --yes" \
+            debian/control || die "mk-build-deps 安装构建依赖失败"
+        # mk-build-deps 会在上级目录留下 *-build-deps_*.deb，必须清掉，
+        # 否则会被后面的 *.deb 收集逻辑误当成产物
+        rm -f ../*build-deps*.deb ./*build-deps*.deb 2>/dev/null || true
+    else
+        die "缺少 mk-build-deps（equivs 未装上），无法自动补齐构建依赖"
+    fi
+fi
 
 # ------------------------------------------------- 2. 覆盖 payload（源码级改动）
 log "== 覆盖定制 payload =="
@@ -115,12 +150,35 @@ mv debian/changelog.new debian/changelog
 head -12 debian/changelog
 
 # ---------------------------------------------------------------- 5. 编包
-log "== dpkg-buildpackage =="
-dpkg-buildpackage -b -us -uc 2>&1 | tail -25
+# 上游 CI 用 `dpkg-buildpackage --host-arch arm64`（本包虽为 Architecture: all，
+# 但源码树含设备侧文件）；老 dpkg 不支持该选项时自动降级为本地架构。
+HOST_ARCH_OPT=""
+if dpkg-buildpackage --help 2>&1 | grep -q -- '--host-arch'; then
+    HOST_ARCH_OPT="--host-arch arm64"
+    dpkg --add-architecture arm64 || true
+fi
+log "== dpkg-buildpackage -us -uc -b $HOST_ARCH_OPT =="
+
+BUILD_LOG="$WORK/dpkg-buildpackage.log"
+set +e
+# shellcheck disable=SC2086
+dpkg-buildpackage -us -uc -b $HOST_ARCH_OPT > "$BUILD_LOG" 2>&1
+rc=$?
+set -e
+tail -40 "$BUILD_LOG"
+if [ "$rc" -ne 0 ]; then
+    echo "E: dpkg-buildpackage 退出码 = $rc" >&2
+    echo "--- 日志中的错误行 ---" >&2
+    grep -aE 'error:|Error |Unmet|unmet|No such|cannot|not found|dh_[a-z]+:' "$BUILD_LOG" | tail -20 >&2 || true
+    echo "--- 完整日志: $BUILD_LOG ---" >&2
+    exit "$rc"
+fi
+
 cd "$WORK"
 ls -lh adapt_*.deb ../*.deb 2>/dev/null || true
 
 log "== 收集产物 =="
-find "$WORK" -maxdepth 2 -name '*.deb' -newermt '-30 minutes' -exec cp -v {} "$OUT/" \;
+find "$WORK" -maxdepth 2 -name '*.deb' ! -name '*build-deps*' -newermt '-30 minutes' \
+    -exec cp -v {} "$OUT/" \;
 ls -lh "$OUT/"
 echo "OK: 定制 adaptation 包 -> $OUT/"

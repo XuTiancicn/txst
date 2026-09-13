@@ -1,13 +1,15 @@
 name: Build custom Droidian marble image (perf-max / SSH / DE optional)
 
 # =============================================================================
-# 一次触发，产出用户要的"定制 Droidian"：
+# 一次触发，产出"定制 Droidian"：
 #   ① adaptation  —— 源码级改上游设备适配包（调速器/温控/服务），编成 deb
 #   ② image       —— 把 deb 注入内部 apt 源 + 改 community_devices.yml +
 #                    drop-in 无桌面 edition，debos 出 fastboot 直刷整刷包
 #   ③ kernel      —— 性能解锁内核（默认 performance governor + 拆降频温控）→ boot.img
 #
-# 全流程在 CI 里跑，本地零依赖、零大文件。
+# 全流程在 CI 里跑：本地零依赖、零大文件、零 SSH 私钥。
+# 失败时会把完整构建日志发到 Release（公开可下载，无需任何凭据）。
+#
 # 源码级改动点见 custom/README.md
 # =============================================================================
 on:
@@ -40,7 +42,8 @@ permissions:
   contents: write
 
 env:
-  DEV_BRANCH: ${{ inputs.dev_branch }}
+  # ★ push 触发时 inputs.* 为空，必须给默认值，否则分支名/edition 会变成空串
+  DEV_BRANCH: ${{ inputs.dev_branch || 'droidian' }}
   DROIDIAN_VERSION: next
 
 jobs:
@@ -52,53 +55,89 @@ jobs:
     outputs:
       editions: ${{ steps.gen.outputs.editions }}
     steps:
+      - uses: actions/checkout@v5
       - id: gen
         run: |
-          case "${{ inputs.editions }}" in
+          case "${{ inputs.editions || 'both' }}" in
             both) E='["phosh","minimal"]' ;;
-            *)    E='["${{ inputs.editions }}"]' ;;
+            *)    E='["${{ inputs.editions || 'phosh' }}"]' ;;
           esac
           echo "editions=$E" >> $GITHUB_OUTPUT
           echo "将构建: $E"
 
   # ---------------------------------------------------------------------------
-  # 1. 定制 adaptation 包（Architecture: all，amd64 上编即可）
+  # 1. 定制 adaptation 包（Architecture: all）
+  #    配方对齐上游 CI：容器 = quay.io/droidian/build-essential，
+  #    构建依赖用 mk-build-deps 装齐，避免"裸机缺依赖直接退出"。
   # ---------------------------------------------------------------------------
   adaptation:
     name: build custom adaptation deb
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    container: quay.io/droidian/build-essential:current-amd64
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - name: 依赖
+      - uses: actions/checkout@v5
+
+      - name: 依赖（跨架构工具 + debhelper）
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq debhelper devscripts fakeroot
+          dpkg --add-architecture arm64
+          apt-get update -qq
+          apt-get install -y -qq --allow-downgrades \
+            devscripts equivs crossbuild-essential-arm64 debhelper fakeroot
+
       - name: 编定制 adaptation deb
         run: |
+          set -o pipefail
           chmod +x custom/scripts/build-adaptation-deb.sh
-          WORK="$PWD/work-adapt" OUT="$PWD/out-adapt" ./custom/scripts/build-adaptation-deb.sh
+          set +e
+          WORK="$PWD/work-adapt" OUT="$PWD/out-adapt" \
+            bash -x ./custom/scripts/build-adaptation-deb.sh > adapt-build.log 2>&1
+          rc=$?
+          set -e
+          echo "=========== adaptation 构建日志（尾部 80 行） ==========="
+          tail -80 adapt-build.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::adaptation 编包失败 rc=$rc"
+            grep -aE '^(E: |dh_|dpkg-|make|sed|cp:|.*error:|.*Error |Unmet|unmet|No such|cannot|not found)' \
+              adapt-build.log | tail -8 | while IFS= read -r l; do
+                echo "::error::${l//%/%%}"
+              done || true
+            exit "$rc"
+          fi
+
       - name: 校验 deb 内容（确认改动真的进包了）
         run: |
           set -x
           DEB=$(ls out-adapt/*.deb | head -1)
           dpkg-deb -I "$DEB" | head -20
           echo "==== 包内关键文件 ===="
-          dpkg-deb -c "$DEB" | grep -E 'droidian-perf|perf-guard|thermal-engine|thermal-normal' || true
+          dpkg-deb -c "$DEB" | grep -E 'droidian-perf|perf-guard|droid-vendor-overlay' || true
           T=$(mktemp -d); dpkg-deb -x "$DEB" "$T"
           echo "==== 包内 droidian-perf.sh 关键行 ===="
           grep -n 'performance\|pkill\|ctl.stop' "$T/usr/bin/droidian-perf.sh" | head
-          echo "==== 中立化后的温控 conf ===="
-          head -3 "$T/usr/lib/droid-vendor-overlay/etc/thermal-engine.conf"
-          echo "==== debian/rules 是否带上新 unit ===="
-          dpkg-deb -e "$DEB" "$T/DEBIAN"
-          ls "$T/DEBIAN"
+          echo "==== 中立化后的温控 conf（应无 sensor/action 规则） ===="
+          cat "$T/usr/lib/droid-vendor-overlay/etc/thermal-engine.conf"
+
       - uses: actions/upload-artifact@v4
         with:
           name: custom-adaptation-debs
           path: out-adapt/*.deb
           if-no-files-found: error
           retention-days: 7
+
+      # ★ 失败时把完整日志发到 Release：公开可下载，无需 token / SSH 私钥
+      - name: 失败时发布构建日志到 Release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-adapt-${{ github.run_number }}
+          name: "[debug] adaptation 构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            commit: `${{ github.sha }}`
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: adapt-build.log
 
   # ---------------------------------------------------------------------------
   # 2. 出整刷包（每个 edition 一个 job）
@@ -113,7 +152,7 @@ jobs:
       matrix:
         edition: ${{ fromJson(needs.matrix.outputs.editions) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 腾空间（runner 根分区很小，debos 要建 loop/LVM）
         run: |
@@ -141,6 +180,7 @@ jobs:
 
       - name: debos 构建（官方 rootfs-builder 容器，arm64 原生）
         run: |
+          set -o pipefail
           SRC="$PWD/work-src-${EDITION}"
           mkdir -p "$SRC/out"
           CID=$(docker run --detach --privileged --cgroupns=host \
@@ -151,6 +191,7 @@ jobs:
                   --security-opt seccomp:unconfined \
                   quay.io/droidian/rootfs-builder:next-arm64 sleep infinity)
           trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          set +e
           docker exec "$CID" /bin/sh -c '
             set -ex
             cd /buildd/sources
@@ -159,8 +200,16 @@ jobs:
             echo "===== generated/droidian.yaml ====="; cat generated/droidian.yaml
             debos --disable-fakemachine generated/droidian.yaml
             cp -r /buildd/sources/out/. /buildd/out/ 2>/dev/null || true
-            ls -lh /buildd/out/
-          '
+            echo "===== /buildd/out ====="; ls -lh /buildd/out/ || true
+          ' 2>&1 | tee debos.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "=========== debos 日志（尾部 60 行） ==========="
+          tail -60 debos.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::debos 构建失败 rc=$rc"
+            exit "$rc"
+          fi
         env:
           EDITION: ${{ matrix.edition }}
 
@@ -208,16 +257,28 @@ jobs:
           fail_on_unmatched_files: true
           make_latest: false
 
+      - name: 失败时发布 debos 日志到 Release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-debos-${{ matrix.edition }}-${{ github.run_number }}
+          name: "[debug] debos 日志 [${{ matrix.edition }}] #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: debos.log
+
   # ---------------------------------------------------------------------------
   # 3. 性能解锁内核
   # ---------------------------------------------------------------------------
   kernel:
     name: perf-unlocked kernel
     runs-on: ubuntu-24.04
-    if: ${{ inputs.build_kernel }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_kernel }}
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 腾空间
         run: |
@@ -228,13 +289,26 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld llvm cpio lz4 flex bison bc \
-            libssl-dev libelf-dev kmod device-tree-compiler dpkg
+            libssl-dev libelf-dev kmod device-tree-compiler dpkg zstd
           clang --version | head -1
 
       - name: 编性能解锁内核
         run: |
+          set -o pipefail
           chmod +x custom/scripts/build-kernel-perf.sh
-          KERNEL_BRANCH="${DEV_BRANCH}" ./custom/scripts/build-kernel-perf.sh
+          set +e
+          KERNEL_BRANCH="${DEV_BRANCH}" \
+            bash -x ./custom/scripts/build-kernel-perf.sh > kernel-build.log 2>&1
+          rc=$?
+          set -e
+          echo "=========== 内核构建日志（尾部 80 行） ==========="
+          tail -80 kernel-build.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::内核构建失败 rc=$rc"
+            grep -aE '(^E: |error:|Error |No such|cannot|not found|unmet)' kernel-build.log \
+              | tail -8 | while IFS= read -r l; do echo "::error::${l//%/%%}"; done || true
+            exit "$rc"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -267,3 +341,15 @@ jobs:
             dist/used.config
           fail_on_unmatched_files: true
           make_latest: false
+
+      - name: 失败时发布内核日志到 Release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-kernel-${{ github.run_number }}
+          name: "[debug] 内核构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: kernel-build.log
