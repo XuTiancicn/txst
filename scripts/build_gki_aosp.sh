@@ -69,6 +69,11 @@
 #   GKI_REF / KERNEL_REPO / CONTAINER / FRAGMENT / OUT
 #   STOCK_UTS        原厂 release string(默认见下)
 #   USE_AOSP_CLANG   1=用官方 clang r416183b(默认, 与原厂 banner 一致) / 0=用系统 clang
+#   CROSS_COMPILE    默认 aarch64-linux-gnu-  ★必须给★: 纯 AOSP 5.10 树只有
+#                    CROSS_COMPILE 非空时才会给 clang 传 --target(Makefile:590),
+#                    否则 clang 按宿主 x86_64 编, asm-offsets.s 立刻报
+#                    "register 'sp' unsuitable for global register variables"
+#   LLVM_IAS         默认 1 = 用 clang 集成汇编器(不依赖 GNU as 版本)
 #   EXTRA_FRAGMENT   merge_config 风格的额外片段(可选, 逗号分隔)
 # =============================================================================
 set -euo pipefail
@@ -136,6 +141,47 @@ fi
 echo "--- clang ---"; clang --version | head -2
 echo "--- ld.lld ---"; ld.lld --version | head -1
 
+# ---- 目标三元组: ★纯 AOSP 5.10 树必须显式给 CROSS_COMPILE, 否则 clang 编 x86_64★ ----
+#   依据 Makefile:590-591
+#       ifneq ($(CROSS_COMPILE),)
+#       CLANG_FLAGS += --target=$(notdir $(CROSS_COMPILE:%-=%))
+#   ⇒ 而 LLVM=1 时 CC 恒为裸 `clang`(Makefile:461 那段的 ifneq ($(LLVM),) 分支),
+#     没有 CROSS_COMPILE 就没人给 clang 传 --target, clang 按宿主 x86_64 编译,
+#     第一个倒下的就是 arch/arm64/kernel/asm-offsets.s:
+#         asm/stack_pointer.h: register 'sp' unsuitable for global register variables
+#         asm/kgdb.h: value '1025' out of range for constraint 'I'
+#   为什么 LineageOS/高通树 `LLVM=1` 裸跑就行? 它们有 scripts/basic/cc-wrapper
+#   (los Makefile:540 `CC := scripts/basic/cc-wrapper $(CC)`) 自动补 target。
+#   纯 AOSP 树没有这东西 ⇒ 我们不抄它, 直接给标准 CROSS_COMPILE。
+#   ⚠ 必须在 [4/8] 生成 .config 之前确定: olddefconfig 会拿 CC 探针的结果去定
+#     CONFIG_BROKEN_GAS_INST / CONFIG_CC_HAS_K_CONSTRAINT / CONFIG_AS_HAS_*,
+#     config 生成时用错编译器 ⇒ 整套 .config 都是脏的。
+CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
+LLVM_IAS="${LLVM_IAS:-1}"     # 用 clang 集成汇编器, 绕开 GNU as 版本代差
+TRIPLE="${CROSS_COMPILE%-}"   # aarch64-linux-gnu-  ->  aarch64-linux-gnu
+export CROSS_COMPILE LLVM_IAS
+log "CROSS_COMPILE=$CROSS_COMPILE (--target=$TRIPLE)  LLVM_IAS=$LLVM_IAS"
+command -v "${CROSS_COMPILE}as" >/dev/null || warn "PATH 里没有 ${CROSS_COMPILE}as (LLVM_IAS=1 时不需要; 若改成 0 就需要装 binutils-aarch64-linux-gnu)"
+
+# ---- 工具链探针: 30 毫秒级, 把"编不了 arm64"这件事在 defconfig 之前就捅破 ----
+PROBE_DIR="$(mktemp -d)"
+printf 'int f(void){register unsigned long sp asm ("sp"); return (int)sp;}\n' > "$PROBE_DIR/p.c"
+printf '.text\n.global _p\n_p:\n\thint #0x22\n\tret\n' > "$PROBE_DIR/p.S"
+case "$LLVM_IAS" in 1) PROBE_IAS=(-fintegrated-as) ;; *) PROBE_IAS=(-fno-integrated-as) ;; esac
+probe_cc() { clang --target="$TRIPLE" "${PROBE_IAS[@]}" -c "$1" -o /dev/null 2>"$PROBE_DIR/err"; }
+probe_cc "$PROBE_DIR/p.c" || die "clang 无法给 $TRIPLE 编译 C: $(head -3 "$PROBE_DIR/err" | tr '\n' ' ')"
+probe_cc "$PROBE_DIR/p.S" || die "clang 无法汇编 $TRIPLE 的 .S: $(head -3 "$PROBE_DIR/err" | tr '\n' ' ')"
+# kbuild 用 `-isystem $(shell $(CC) -print-file-name=include)` 找 stddef.h,
+# clang 若因 --gcc-toolchain 猜错而回一个相对路径, 后面会以 'stddef.h not found' 炸掉
+PROBE_INC="$(clang --target="$TRIPLE" -print-file-name=include)"
+case "$PROBE_INC" in /*) ;; *) die "clang -print-file-name=include 返回相对路径 '$PROBE_INC' (kbuild 的 -isystem 会崩)" ;; esac
+[ -d "$PROBE_INC" ] || die "clang -print-file-name=include 指向不存在的目录: $PROBE_INC"
+log "探针通过: C/汇编/include 三关全过 (include=$PROBE_INC)"
+rm -rf "$PROBE_DIR"
+
+# 所有 make 都要带上这两个变量(含 kernelversion/kernelrelease/defconfig —— 探针一致性)
+GKI_MAKE=(ARCH=arm64 LLVM=1 "CROSS_COMPILE=$CROSS_COMPILE" "LLVM_IAS=$LLVM_IAS")
+
 # ══════════════════════════════════════════════════ [3/8] 源码
 log "===== [3/8] clone Google AOSP 内核 ($GKI_REF @ $KERNEL_REPO) ====="
 rm -rf "$KERNEL_DIR"
@@ -150,7 +196,25 @@ log "git describe: $GIT_DESCRIBE"
 
 # ══════════════════════════════════════════════════ [4/8] 生成 .config
 log "===== [4/8] gki_defconfig + 定制片段 ====="
-make ARCH=arm64 LLVM=1 gki_defconfig >/dev/null
+make "${GKI_MAKE[@]}" gki_defconfig >/dev/null
+
+# ---- 工具链实战探针: 真跑一遍 prepare(as 会编那个失败过的 asm-offsets.s) ----
+#   run#24 就死在这: asm-offsets.s 报
+#     asm/stack_pointer.h: register 'sp' unsuitable for global register variables
+#     asm/kgdb.h: value '1025' out of range for constraint 'I'
+#   = clang 在按 x86_64 编。prepare 只要 1~2 分钟, 就能确认工具链真能出 arm64
+#   目标文件; 比等 60 分钟编译到一半再炸划算得多。(顺带: prepare 也会生成
+#   include/config/auto.conf, 后面 setlocalversion 就有的读了)
+log "工具链实战探针: make prepare (内含踩过坑的 arch/arm64/kernel/asm-offsets.s)"
+if ! make "${GKI_MAKE[@]}" -j"$(nproc)" prepare >.probe-prepare.log 2>&1; then
+    { echo "E: 工具链实战探针失败 —— clang 没能产出 arm64 目标文件";
+      grep -nE "error:|fatal error|Error [0-9]+" .probe-prepare.log | head -20;
+      tail -20 .probe-prepare.log; } >&2
+    die "prepare 探针失败 (CROSS_COMPILE=$CROSS_COMPILE LLVM_IAS=$LLVM_IAS)"
+fi
+[ -f arch/arm64/kernel/asm-offsets.s ] || die "prepare 过了但 asm-offsets.s 没生成, 工具链判定不可信"
+log "探针通过: prepare OK, asm-offsets.s $(wc -c < arch/arm64/kernel/asm-offsets.s) 字节"
+
 if [ -s "$FRAGMENT" ]; then
     # shellcheck disable=SC2046
     ./scripts/config --file .config $(grep -vE '^[[:space:]]*(#|$)' "$FRAGMENT")
@@ -161,10 +225,13 @@ if [ -n "${EXTRA_FRAGMENT:-}" ]; then
     ./scripts/kconfig/merge_config.sh -m .config "${_fr[@]}" >/dev/null
     log "已 merge 额外片段: $EXTRA_FRAGMENT"
 fi
+# 生成 config 时用的是哪个编译器, 直接决定 CONFIG_CC_IS_* / BROKEN_GAS_INST 等探针结果
+grep -E '^CONFIG_CC_VERSION_TEXT=' .config | head -1 | sed 's/^/I:   /' || true
+grep -E '^CONFIG_(CC_IS_CLANG|BROKEN_GAS_INST|ARM64_USE_LSE_ATOMICS)=' .config | sed 's/^/I:   /' || true
 
 # ══════════════════════════════════════════════════ [5/8] 精确复刻版本串
 log "===== [5/8] 复刻原厂 UTS_RELEASE ====="
-KV_BASE="$(make -s ARCH=arm64 kernelversion 2>/dev/null | tail -1 || true)"
+KV_BASE="$(make -s "${GKI_MAKE[@]}" kernelversion 2>/dev/null | tail -1 || true)"
 [ -n "$KV_BASE" ] || die "拿不到源码 KERNELVERSION(Makefile 里 VERSION/PATCHLEVEL/SUBLEVEL)"
 log "源码基线 KERNELVERSION = $KV_BASE"
 case "$STOCK_UTS" in
@@ -187,13 +254,13 @@ log "要构造的完整 release = ${KV_BASE}${LOCALV_SUFFIX}${BUILD_NO:+-ab${BUI
 # ---- (1) 装 CONFIG_LOCALVERSION + 关 LOCALVERSION_AUTO(git describe 自动追加) ----
 ./scripts/config --file .config --set-str LOCALVERSION "$LOCALV_SUFFIX"
 ./scripts/config --file .config --disable LOCALVERSION_AUTO
-make ARCH=arm64 LLVM=1 olddefconfig >/dev/null
+make "${GKI_MAKE[@]}" olddefconfig >/dev/null
 
 # ---- (2) ★显式生成 include/config/auto.conf★(run#23 失败根因, 别删这条) ----
 #   `make kernelrelease` 属 no-sync-config-targets(Makefile:289) ⇒ 走 config-build 分支,
 #   既不包含也不生成 auto.conf; 而 scripts/setlocalversion:186 找不到它会 `exit 1`
 #   (错误只走 stderr, 被 $( ) 吞掉) ⇒ 版本串退化成裸基线。必须显式 syncconfig。
-make ARCH=arm64 LLVM=1 syncconfig >/dev/null 2>&1 || true
+make "${GKI_MAKE[@]}" syncconfig >/dev/null 2>&1 || true
 [ -f include/config/auto.conf ] || die "make syncconfig 没能生成 include/config/auto.conf"
 log "auto.conf 已就绪: $(grep '^CONFIG_LOCALVERSION' include/config/auto.conf || echo '!! 里面没有 CONFIG_LOCALVERSION')"
 
@@ -203,14 +270,20 @@ log "auto.conf 已就绪: $(grep '^CONFIG_LOCALVERSION' include/config/auto.conf
 export LOCALVERSION=""
 if [ -n "$BUILD_NO" ]; then export BUILD_NUMBER="$BUILD_NO"; fi
 
-# ---- (4) 断言 + 失败时把诊断一次性全打出来 ----
+# ---- (4) 断言 ----
+#   ★注意 `make kernelrelease` 的输出**不含** -ab<BUILD_NUMBER>:
+#     kernelrelease 目标(Makefile:2027-2029)只拼 KERNELVERSION+setlocalversion;
+#     "-ab$(BUILD_NUMBER)" 是 UTS_RELEASE 专属(Makefile:1390-1391, 进 utsrelease.h)。
+#     所以这里断言的是 KERNELRELEASE, 完整 STOCK_UTS 的断言放在 [7/8](utsrelease.h + Image)。
+EXPECTED_KREL="${KV_BASE}${LOCALV_SUFFIX}"
 #   `|| true` 是给 set -e/pipefail 用的: make 失败也算"实得空串", 走诊断分支而不是直接崩
-ACTUAL="$(make -s ARCH=arm64 LLVM=1 kernelrelease 2>.krel.err | tail -1 || true)"
+ACTUAL="$(make -s "${GKI_MAKE[@]}" kernelrelease 2>.krel.err | tail -1 || true)"
 KREL_OVERRIDE=""
-if [ "$ACTUAL" = "$STOCK_UTS" ]; then
-    log "自然复刻成功: make kernelrelease = $ACTUAL"
+if [ "$ACTUAL" = "$EXPECTED_KREL" ]; then
+    log "自然复刻成功: KERNELRELEASE = $ACTUAL"
+    log "  ⇒ UTS_RELEASE = ${EXPECTED_KREL}${BUILD_NO:+-ab${BUILD_NO}}   (= $STOCK_UTS)"
 else
-    warn "自然复刻失败: 期望 '$STOCK_UTS'  实得 '$ACTUAL'"
+    warn "自然复刻失败: 期望 '$EXPECTED_KREL'  实得 '$ACTUAL'"
     warn "  setlocalversion 直调输出 : '$( (sh scripts/setlocalversion .) 2>&1 || true )'"
     warn "  .config                  : $(grep -n '^CONFIG_LOCALVERSION' .config || echo '(无)')"
     warn "  auto.conf                : $(grep -n '^CONFIG_LOCALVERSION' include/config/auto.conf 2>/dev/null || echo '(无)')"
@@ -226,12 +299,12 @@ fi
 # ══════════════════════════════════════════════════ [6/8] 编译
 log "===== [6/8] 编译 Image (共享核心 compile_kernel.sh) ====="
 # 官方 clang 12 不需要 frame-larger-than 降级 ⇒ KCFLAGS 显式置空(保留变量以便覆盖)
+EXTRA_MAKE=("CROSS_COMPILE=$CROSS_COMPILE" "LLVM_IAS=$LLVM_IAS")
 if [ -n "$KREL_OVERRIDE" ]; then
     warn "本次编译用命令行变量 KERNELRELEASE=$KREL_OVERRIDE 钉死版本串"
-    KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image "KERNELRELEASE=$KREL_OVERRIDE"
-else
-    KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image
+    EXTRA_MAKE+=("KERNELRELEASE=$KREL_OVERRIDE")
 fi
+KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image "${EXTRA_MAKE[@]}"
 
 # ══════════════════════════════════════════════════ [7/8] 装配 + 双重复核
 log "===== [7/8] 装配 boot.img 并复核 ====="

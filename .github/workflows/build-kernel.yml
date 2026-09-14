@@ -316,9 +316,14 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update -qq
+          # binutils-aarch64-linux-gnu: 让 kbuild 的 `which aarch64-linux-gnu-elfedit`
+          # 能解析到 /usr/bin/ ⇒ --prefix=/usr/bin/aarch64-linux-gnu- 正常
+          # (否则或退化成 --prefix=./aarch64-linux-gnu-)。LLVM_IAS=1 时用不到 GNU as,
+          # 但留着它是零风险的兜底。
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential bc flex bison libssl-dev libelf-dev \
             cpio kmod zstd lz4 xz-utils device-tree-compiler \
+            binutils-aarch64-linux-gnu \
             python3 python3-yaml git
           df -h / | tail -1
 
