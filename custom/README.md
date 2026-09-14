@@ -55,12 +55,17 @@ adaptation-xiaomi-marble @ droidian      ← 设备适配包（.deb）
 |---|---|
 | `edition` | `phosh`（有桌面，完整系统）/ `minimal`（纯服务端无桌面） |
 | `rootfs_size_gb` | 留空 = **动态容量**（首启扩到 userdata 分区满）；填 `100` 等 = 固定容量兜底 |
-| `rebuild_kernel` | 勾上才重编 GKI 内核（60~240 分钟）；不勾 = 直接取最新 `gki-*` Release 的 boot.img |
+| `rebuild_kernel` | **默认勾选 = 重编 GKI 内核**（60~240 分钟），保证内核与系统包同源同新；只有手动明确取消勾选才跳过、退回取最新 `gki-*` Release |
 | `force` / `activity_days` | 活跃度闸门：`main` 超过 N 天没提交就跳过自动构建，手动勾 `force` 可忽略 |
 
 自动触发：**每天北京时间 00:00**（cron `0 16 * * *` UTC）跑一遍，**或**推 main 且改到
 内核/镜像链文件（`custom/**`、`scripts/**`、`stock-os2050/**`）时跑一遍；
 **仅在项目活跃时执行** —— `main` 上超过 `activity_days`（默认 30）天没提交就整体跳过。
+
+**一切产物都出自本工作流**：每次运行开头有 `prune` job 清理旧工作流遗留的 Release
+（`kernel-*` / `debug-gki-*` / `droidian-custom-*` / 任何 `debug-*`），并只保留
+**最新 1 个 `gki-*`** 与**最新 2 个 `marble-system-*`**。同组新运行会**打断**旧运行
+（`cancel-in-progress: true`），不会两个 debos 叠跑。
 
 产出：Release **`marble-system-<run>`** → 一个 zip，解压后
 - `./flash_all.sh` —— 整刷（boot/userdata，会清空 userdata）
