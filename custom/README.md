@@ -58,7 +58,9 @@ adaptation-xiaomi-marble @ droidian      ← 设备适配包（.deb）
 | `rebuild_kernel` | 勾上才重编 GKI 内核（60~240 分钟）；不勾 = 直接取最新 `gki-*` Release 的 boot.img |
 | `force` / `activity_days` | 活跃度闸门：`main` 超过 N 天没提交就跳过自动构建，手动勾 `force` 可忽略 |
 
-自动：**每天北京时间 00:00**（cron `0 16 * * *` UTC）跑一遍，仅在项目活跃时执行。
+自动触发：**每天北京时间 00:00**（cron `0 16 * * *` UTC）跑一遍，**或**推 main 且改到
+内核/镜像链文件（`custom/**`、`scripts/**`、`stock-os2050/**`）时跑一遍；
+**仅在项目活跃时执行** —— `main` 上超过 `activity_days`（默认 30）天没提交就整体跳过。
 
 产出：Release **`marble-system-<run>`** → 一个 zip，解压后
 - `./flash_all.sh` —— 整刷（boot/userdata，会清空 userdata）

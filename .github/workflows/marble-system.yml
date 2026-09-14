@@ -22,13 +22,24 @@ name: Marble 完整系统整刷包（Droidian + GKI 内核）
 # ── 自动编译只在项目活跃时进行 ──────────────────────────────────────────
 #   gate job 读 main 上最后一次提交距今的天数：> activity_days(默认30) 即
 #   整体跳过，不烧 CI。手动 Run workflow 可勾 force 忽略闸门。
-#   每天北京时间 00:00 跑一遍（GitHub cron 用 UTC，故写 0 16 * * *）。
+#   触发方式：
+#     ① 每天北京时间 00:00 跑一遍（GitHub cron 用 UTC，故写 0 16 * * *）
+#     ② 推 main 且改到内核/镜像链相关文件（custom/** scripts/** stock-os2050/**）
+#     ③ 手动 Run workflow
 # =============================================================================
 
 on:
   schedule:
     # 北京时间 00:00 == UTC 16:00（前一天）
     - cron: '0 16 * * *'
+  # 项目活跃（下面这些文件有改动）时也自动编译一遍；不相干的提交不触发。
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/marble-system.yml'
+      - 'custom/**'
+      - 'scripts/**'
+      - 'stock-os2050/**'
   workflow_dispatch:
     inputs:
       force:
