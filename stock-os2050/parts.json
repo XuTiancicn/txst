@@ -1,0 +1,14 @@
+{
+  "source": "images",
+  "source_boot_img_size": 201326592,
+  "header_version": 4,
+  "header_size": 1584,
+  "os_version_raw": "0x18000189",
+  "os_version": "12.0.0",
+  "os_patch_level": "2024-09",
+  "kernel_size_stock": 46848116,
+  "ramdisk_size": 1380091,
+  "boot_signature_size": 4096,
+  "ramdisk_sha256": "2b7a94368b21a6cb7a65ccf152e729ab0bc4b36282438de5ce248ff1d4a5655d",
+  "boot_signature_sha256": "0d0c4b6dcd73ae8cbf657bcaa26b0cf1c589ea2c62261b5fee9009248a491501"
+}

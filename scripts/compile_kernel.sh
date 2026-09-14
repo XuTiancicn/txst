@@ -44,7 +44,12 @@ free -h | head -2 || true
 echo "===== [编译] make $TARGET (LLVM=1 KCFLAGS=-Wno-frame-larger-than, -j$(nproc)) ====="
 # 日志落盘 + 后台 make + 前台心跳: make -j 全量输出进 build.log (防 Actions 日志刷爆/
 # 4MB 截断), 每 45s 打印一次进度行, 控制台不再长时间静默 (心跳: 行数 + 最近一条编译行)
-make ARCH=arm64 LLVM=1 KCFLAGS=-Wno-frame-larger-than -j"$(nproc)" "$TARGET" > build.log 2>&1 &
+# KCFLAGS 可被调用方覆盖:
+#   - 系统 clang(Ubuntu 18)编 5.10 时需要 -Wno-frame-larger-than (见上方历史坑 2)
+#   - 官方 clang r416183b (clang 12) 不需要 ⇒ 调用方传 KCFLAGS= 置空
+KCFLAGS="${KCFLAGS--Wno-frame-larger-than}"
+echo "KCFLAGS='${KCFLAGS}'"
+make ARCH=arm64 LLVM=1 KCFLAGS="$KCFLAGS" -j"$(nproc)" "$TARGET" > build.log 2>&1 &
 MPID=$!
 LAST_LINES=0
 while kill -0 "$MPID" 2>/dev/null; do

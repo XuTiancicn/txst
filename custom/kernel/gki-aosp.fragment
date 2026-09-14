@@ -1,0 +1,49 @@
+# =============================================================================
+# gki-aosp.fragment — AOSP kernel/common (android12-5.10) 的 marble 定制片段
+#
+# 消费方式:  ./scripts/config --file .config $(grep -vE '^\s*#|^\s*$' 本文件)
+# 约定:      每行一个开关, 以 -- 开头; 空行与 # 注释会被忽略.
+#
+# ★ 为什么只有这么几行 ★
+#   GKI 的厂商模块（/vendor/lib/modules、/system_dlkm）是**按 KMI 白名单**
+#   (android/abi_gki_aarch64*) 预编译好的二进制, 装载时内核校验
+#     ① vermagic 的标志位段(SMP/preempt/mod_unload/aarch64)
+#     ② module_layout 结构体 CRC
+#     ③ 每个被引用导出符号的 CRC
+#   （版本串那一段在"模块带 CRC"时被内核显式跳过 —— kernel/module.c:1378
+#     的 same_magic 注释原文。但这不改变下面的结论。）
+#   因此任何会
+#     (a) 删掉 / 新增导出符号, 或
+#     (b) 改动导出结构体布局
+#   的配置项, 都会让厂商模块拒绝加载 —— 表现是黑屏 / 无 USB / 无基带,
+#   而不是"某个功能不可用"。所以这里**只动 Kconfig 的 choice 默认值**:
+#   默认值只改 .rodata 里的一个字符串, 不参与任何符号导出。
+#   想加"激进项"请先读 custom/README.md 的「KMI 红线」一节。
+# =============================================================================
+
+# -------------------------------------------------------------- A. 默认调速器
+# 用户目标: "Linux 调速器默认改成最高性能"。
+# governor 的**编译**由 CONFIG_CPU_FREQ_GOV_<X> 单独控制, 与下面这个 choice
+# 无关; 改 choice 只是换掉开机时 cpufreq 选用的默认 governor 名字.
+--enable  CPU_FREQ_GOV_PERFORMANCE
+--enable  CPU_FREQ_DEFAULT_GOV_PERFORMANCE
+--disable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+--disable CPU_FREQ_DEFAULT_GOV_ONDEMAND
+--disable CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
+--disable CPU_FREQ_DEFAULT_GOV_POWERSAVE
+--disable CPU_FREQ_DEFAULT_GOV_USERSPACE
+
+# -------------------------------------------------------- B. 构建宽容 (ABI 中性)
+# CONFIG_WERROR=y 时任何编译器新警告都会中断构建; 关掉它不改变任何 ABI.
+--disable WERROR
+
+# =============================================================================
+# 以下为「激进项」模板 —— 默认全部注释掉, 改 KMI 风险自担 (见 README)
+#   关掉 CFI/LTO 可以让系统 clang 编得动, 但原厂内核实测带旧式 CFI
+#   (Image 里有 __cfi_ / .cfi_jt / cfi_check 串, 无 kcfi), 厂商模块是按
+#   CFI 方案编译的 ⇒ 关掉后模块会因为缺 __cfi_* 符号而加载失败.
+# --disable CFI_CLANG
+# --disable LTO_CLANG_FULL
+# --enable  LTO_NONE
+# --disable SHADOW_CALL_STACK
+# =============================================================================

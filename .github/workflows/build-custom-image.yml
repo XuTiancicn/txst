@@ -31,9 +31,11 @@ on:
         description: 'droidian-xiaomi-marble 分支（必须是 droidian，trixie 无 marble）'
         type: string
         default: droidian
-  # ★推本分支上任何 custom/ 改动即自动构建一遍（无需 PAT、无需手点 Run workflow）
+  # ★推 main 上任何 custom/ 改动即自动构建一遍（无需 PAT、无需手点 Run workflow）
+  #   原先只在特性分支 custom-perf 上生效；改为"一律合并到主分支"后同步到 main，
+  #   否则合并到 main 后这条自动触发就彻底失效了。
   push:
-    branches: [custom-perf]
+    branches: [main, master]
     paths:
       - 'custom/**'
       - '.github/workflows/build-custom-image.yml'

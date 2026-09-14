@@ -1,20 +1,56 @@
-name: Build Marble Kernel (LOS + Droidian display)
+name: Build Marble Kernel (AOSP GKI + LOS + Droidian display)
 
 # =============================================================================
-# 单一 workflow / 双 job — 一次触发只产生一个 run, 并行产出两个内核:
-#   ① lineage-gki        LineageOS 23.2 (Android 16) GKI 内核
-#   ② droidian-display   Droidian 5.10.238 + DRM_MSM 显示驱动内置内核
-# 编译核心共用 scripts/compile_kernel.sh (swap 兜底/KCFLAGS/失败诊断, 单点维护)
+# 三个内核 job, 编译核心共用 scripts/compile_kernel.sh (swap 兜底/KCFLAGS/失败诊断):
+#   ① gki-aosp           ★推送即跑★ Google AOSP kernel/common 的 GKI 内核,
+#                        用原厂 OS2.0.5.0.VMRCNXM 的 boot 容器重打包
+#   ② lineage-gki        LineageOS 23.2 GKI 内核            (手动勾选)
+#   ③ droidian-display   Droidian + DRM_MSM 显示驱动内核     (手动勾选)
+#
+# ②③ 由「推送即跑」改为「手动勾选」的原因:
+#   - 内核来源已按要求切到 Google AOSP(见 ①), ②③ 不再走主流程;
+#   - 两者各要 90~120 分钟, 不该每次 push 都烧; 需要用旧线时在 Actions
+#     页面 Run workflow 里勾上对应开关即可, 代码路径完全保留。
 # =============================================================================
 on:
   workflow_dispatch:
     inputs:
+      build_gki:
+        description: '① AOSP GKI 内核 (kernel/common + 原厂容器重打包)'
+        type: boolean
+        default: true
+      build_los:
+        description: '② LineageOS 23.2 GKI 内核 (旧线, 90 分钟)'
+        type: boolean
+        default: false
+      build_droidian_display:
+        description: '③ Droidian + DRM_MSM 显示内核 (旧线, 120 分钟)'
+        type: boolean
+        default: false
       kernel_branch:
-        description: 'Droidian display 内核分支 (仅手动触发生效, 默认 droidian)'
+        description: '③ 的内核分支'
         required: false
         default: 'droidian'
+      aosp_clang:
+        description: '① 用官方预编译 clang r416183b (填 0 改用系统 clang, 仅调试)'
+        type: string
+        default: '1'
+      gki_ref:
+        description: '① AOSP kernel/common 的 tag/分支'
+        type: string
+        default: 'android12-5.10.209_r00'
   push:
     branches: [main, master]
+    # 只在改到内核构建链相关文件时触发 (以前是任何 push 都会跑满 90+120 分钟)
+    paths:
+      - 'scripts/build_gki_aosp.sh'
+      - 'scripts/compile_kernel.sh'
+      - 'scripts/repack_boot.py'
+      - 'scripts/unpack_boot_v4.py'
+      - 'scripts/make_sideload_zip.py'
+      - 'custom/kernel/gki-aosp.fragment'
+      - 'stock-os2050/**'
+      - '.github/workflows/build-kernel.yml'
 
 permissions:
   contents: write
@@ -28,6 +64,8 @@ jobs:
   lineage-gki:
     name: LineageOS 23.2 GKI kernel
     runs-on: ubuntu-24.04
+    # 手动勾选才跑 (改由 AOSP GKI job 承担主线, 见文件头说明)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_los }}
     timeout-minutes: 90
 
     steps:
@@ -179,6 +217,8 @@ jobs:
   droidian-display:
     name: Droidian 5.10.238 + DRM_MSM display kernel
     runs-on: ubuntu-24.04
+    # 手动勾选才跑 (改由 AOSP GKI job 承担主线, 见文件头说明)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_droidian_display }}
     timeout-minutes: 120
 
     steps:
@@ -236,3 +276,144 @@ jobs:
             dist/Image
           fail_on_unmatched_files: true
           make_latest: false
+
+  # ---------------------------------------------------------------------------
+  # ① AOSP GKI 内核 —— Google 官方 kernel/common, 推送即跑
+  #
+  #   源码  : aosp-mirror/kernel_common @ android12-5.10.209_r00
+  #           (= 原厂内核基线 v5.10.209, GKI KMI 代号 android12-9)
+  #   容器  : 仓库内 stock-os2050/ (原厂 OS2.0.5.0.VMRCNXM 的 boot 段)
+  #   工具链: clang r416183b (clang 12.0.5) —— 与原厂 banner 完全一致。
+  #           原厂内核实测带旧式 CFI(__cfi_ / .cfi_jt / cfi_check, 无 kcfi),
+  #           且 gki_defconfig 是 CONFIG_CFI_CLANG=y + LTO_CLANG_FULL=y,
+  #           系统 clang 18 编不动(旧式 -fsanitize=cfi / -flto=full 已变),
+  #           所以必须用官方预编译 clang。
+  #   产物  : boot.img / Image / System.map / 生效 config / sideload OTA zip
+  #   失败  : 完整日志发到 Release tag debug-gki-<run_number>(公开可下, 零凭据)
+  # ---------------------------------------------------------------------------
+  gki-aosp:
+    name: AOSP GKI kernel (kernel/common android12-5.10)
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_gki) }}
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: 腾磁盘 (内核源码 ~1.5G + 官方 clang ~1.5G + FULL-LTO 产物)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          # 保留 runner 自带 swap: compile_kernel.sh 还会再挂 8G(/mnt/swap8g),
+          # FULL-LTO 链接阶段吃内存, 两个 swap 叠加更稳
+          swap-storage: false
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            cpio kmod zstd lz4 xz-utils device-tree-compiler \
+            python3 python3-yaml git
+          df -h / | tail -1
+
+      - name: 编 AOSP GKI 内核 + 用原厂容器重打包
+        env:
+          USE_AOSP_CLANG: ${{ github.event_name == 'workflow_dispatch' && inputs.aosp_clang || '1' }}
+          GKI_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.gki_ref || 'android12-5.10.209_r00' }}
+        run: |
+          set -o pipefail
+          chmod +x scripts/build_gki_aosp.sh scripts/compile_kernel.sh
+          echo "USE_AOSP_CLANG=$USE_AOSP_CLANG"
+          echo "GKI_REF=$GKI_REF"
+          set +e
+          bash scripts/build_gki_aosp.sh > gki-build.log 2>&1
+          rc=$?
+          set -e
+          echo "===== build rc=$rc ====="
+          grep -nE '^I: |^W: |^E: ' gki-build.log | tail -70 || true
+          if [ "$rc" -ne 0 ]; then
+            echo "===== 关键错误行 ====="
+            grep -nE "error:|Error [0-9]+|Killed|fatal|No space left|undefined reference|E: " gki-build.log | head -40 || true
+            echo "===== 末尾 60 行 ====="
+            tail -60 gki-build.log
+            echo "::error::AOSP GKI 内核构建失败 rc=$rc —— 完整日志见 Release tag debug-gki-${{ github.run_number }}"
+          fi
+          exit "$rc"
+
+      - name: 产物摘要
+        if: success()
+        run: |
+          ls -lh dist/
+          echo "---------------- gki-info.txt ----------------"
+          cat dist/gki-info.txt
+
+      - name: Upload kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-gki-aosp
+          path: |
+            dist/boot.img
+            dist/gki-marble-sideload.zip
+            dist/Image
+            dist/System.map
+            dist/gki-aosp-used.config
+            dist/gki-info.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gki-${{ github.run_number }}
+          name: "Marble AOSP GKI kernel #${{ github.run_number }}"
+          body: |
+            用 **Google AOSP 官方内核源码**为 marble 编的 GKI 内核。
+
+            - 设备: 红米 Note 12 Turbo / POCO F5 (marble, SM7475)
+            - 源码: `aosp-mirror/kernel_common @ android12-5.10.209_r00`
+              (= 原厂 HyperOS OS2.0.5.0.VMRCNXM 内核基线 v5.10.209, KMI 代号 android12-9)
+            - 工具链: 官方预编译 clang r416183b (clang 12.0.5, 与原厂 banner 一致)
+            - boot 容器: 原厂 `OS2.0.5.0.VMRCNXM/images/boot.img` 的 header+ramdisk+signature
+              (仅替换内核段, 内核段为 raw 未压缩 arm64 Image —— marble ABL 不认 gzip 段)
+            - 提交: `${{ github.sha }}`
+
+            **文件说明**
+            - `boot.img` — 完整可刷 GKI 映像 (`fastboot flash boot_ab boot.img`)
+            - `gki-marble-sideload.zip` — TWRP adb sideload 包 (自动判 A/B 槽 + 回读校验)
+            - `Image` — 未压缩 arm64 内核
+            - `gki-aosp-used.config` — 实际生效的内核配置
+            - `gki-info.txt` — 构建溯源 (源码 sha / UTS_RELEASE / 容器 sha256 / 工具链)
+
+            **注意**: 本内核源码为**纯 AOSP GKI**, 不含任何 Xiaomi/Qualcomm 专有代码;
+            硬件驱动与设备树由原厂 `vendor_boot`/`vendor_dlkm`/`dtbo` 提供, 均未改动。
+          files: |
+            dist/boot.img
+            dist/gki-marble-sideload.zip
+            dist/Image
+            dist/gki-aosp-used.config
+            dist/gki-info.txt
+          fail_on_unmatched_files: false
+          make_latest: false
+
+      - name: 失败 -> 完整日志发到 Release (公开可下, 零凭据)
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-gki-${{ github.run_number }}
+          name: "[debug] AOSP GKI 构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            本仓库取不了 Actions 日志正文(REST API 需 token), 故把全量日志发成 Release 产物,
+            `releases/download/...` 免凭据即可下载。
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: gki-build.log

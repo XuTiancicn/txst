@@ -2,3 +2,9 @@
 *.py text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+# 下面这些是"被脚本逐行解析"的文本: 一旦混进 CR, scripts/config 会把
+# "--enable X\r" 当成未知选项静默跳过 ⇒ 配置悄悄不生效。必须锁 LF。
+*.fragment text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf

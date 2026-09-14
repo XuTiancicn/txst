@@ -192,20 +192,22 @@ ls -lh "$BOOT_IMG"
 
 python3 scripts/unpack_boot_v4.py "$BOOT_IMG" stock-238
 
-# 内核段 gzip 压缩: 新 Image 49MB(DRM_MSM built-in) > 原容器 kernel 段 40MB,
-# 未压缩重打包 boot.img 约 66.7MB 有溢出 boot 分区风险. 按 GKI 官方 boot.img 规范
-# (kernel 段即 Image.gz) 压缩后约 25MB, 整包 ~44MB 稳放 (marble 跑 GKI, ABL 必支持 gzip 解压)
-gzip -n -9 -c kernel/arch/arm64/boot/Image > stock-238/kernel.gz
-echo "--- 内核段 gzip 后 ---"
-ls -lh stock-238/kernel.gz
+# 内核段 = raw 未压缩 (与官方布局一致; 重要修正见下)
+# 2026-09-09 修正: 此前误用 gzip 打包内核段, 实测 9/6 双槽刷入卡第一屏无 USB.
+# 已实锤官方 HyperOS boot.img(kernel 5.10.209 raw MZ 44.68MB)与官方 Droidian
+# boot.img(5.10.238 raw MZ 40.9MB)内核段均为 raw 未压缩 -> marble ABL 不认 gzip 段.
+# 新 Image 48.1MB + 官方 ramdisk 18.5MB = 整包 ~66.7MB, boot 分区 192MB, 无溢出风险.
+cp kernel/arch/arm64/boot/Image stock-238/kernel.raw
+echo "--- 内核段 raw (未压缩) ---"
+ls -lh stock-238/kernel.raw
 python3 - <<'PYEOF'
-k = open('stock-238/kernel.gz','rb').read(2)
-assert k == b'\x1f\x8b', f"gzip magic 错误: {k.hex()}"
-print("gzip 头 OK (1f8b)")
+k = open('stock-238/kernel.raw','rb').read(2)
+assert k == b'MZ', f"内核段不是 raw Image (需 MZ 头): {k.hex()}"
+print("raw Image 头 OK (MZ, 未压缩)")
 PYEOF
 
 python3 scripts/repack_boot.py \
-    stock-238/kernel.gz \
+    stock-238/kernel.raw \
     stock-238/header.bin \
     stock-238/ramdisk \
     stock-238/boot_signature \
@@ -223,11 +225,11 @@ sigsz = struct.unpack_from('<I', d, 1580)[0]
 print(f"总大小: {len(d)} bytes ({len(d)/1024/1024:.1f} MB)")
 print(f"header_version={hv} kernel_size={ksz} ({ksz/1024/1024:.1f} MB) ramdisk_size={rsz} signature_size={sigsz}")
 assert hv == 4 and ksz > 0 and rsz > 0
-# 内核段 = gzip 压缩 Image (GKI 规范), magic 1f8b; 若后续改回未压缩则为 MZ
+# 内核段 = raw 未压缩 Image, magic MZ (与官方 HyperOS/Droidian 布局一致)
 k = d[4096:4096+ksz]
-assert k[:2] == b'\x1f\x8b', f"内核段不是 gzip: {k[:2].hex()}"
-print("kernel 段 gzip 头 OK, boot.img 校验通过")
-print(f"整包 {len(d)/1024/1024:.1f} MB < 官方容器原包 59MB, 无分区溢出风险")
+assert k[:2] == b'MZ', f"内核段不是 raw Image: {k[:2].hex()}"
+print("kernel 段 raw (MZ) OK, boot.img 校验通过")
+print(f"整包 {len(d)/1024/1024:.1f} MB < boot 分区 192MB, 无分区溢出风险")
 PYEOF
 
 echo ""

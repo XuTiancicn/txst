@@ -1,0 +1,17 @@
+# ---- 内核构建的外部源码 / 产物（绝不入库; 仓库要一直保持"零大文件"）----
+/kernel/            # build_gki_aosp.sh 克隆的 AOSP 内核树 (~1.5G)
+/toolchain/         # 官方预编译 clang r416183b (~1.5G)
+/dist/              # 构建产物
+boot238.deb
+stock-238/          # 从官方 Droidian 包解出的 boot 容器件（临时）
+stock_unpacked/
+droidian-fastboot-builder/work/
+
+# ---- 日志 ----
+build.log
+*-build.log
+gki-build.log
+
+# ---- Python ----
+__pycache__/
+*.pyc
