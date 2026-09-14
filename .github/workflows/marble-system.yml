@@ -26,6 +26,14 @@ name: Marble 完整系统整刷包（Droidian + GKI 内核）
 #     ① 每天北京时间 00:00 跑一遍（GitHub cron 用 UTC，故写 0 16 * * *）
 #     ② 推 main 且改到内核/镜像链相关文件（custom/** scripts/** stock-os2050/**）
 #     ③ 手动 Run workflow
+#
+# ── 「一切产物都必须出自本工作流」─────────────────────────────────────
+#   · 内核：默认**每次都重编**（只有手动 dispatch 且明确取消勾选 rebuild_kernel
+#     才跳过），保证 boot-gki.img 与本次系统包同源同新。
+#   · prune job：每次运行先把旧工作流遗留的 Release 删掉
+#     （kernel-* / debug-gki-* / droidian-custom-* / 任何 debug-*），
+#     并只保留最新 1 个 gki-* 与最新 2 个 marble-system-*。
+#   · 并发：同组新运行会**打断**旧运行（cancel-in-progress），不会两个 debos 叠跑。
 # =============================================================================
 
 on:
@@ -62,17 +70,17 @@ on:
         type: string
         default: ''
       rebuild_kernel:
-        description: '重编 GKI 内核（勾上=跑 60~240 分钟；不勾=直接用最新 gki-* Release）'
+        description: '重编 GKI 内核（默认勾选；取消勾选=跳过内核重编，直接用最新 gki-* Release）'
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
 
-# 一次只跑一个，避免两个 debos 抢资源（不打断已在跑的）
+# 一次只跑一个；新的运行会打断旧的（既避免两个 debos 抢资源，也保证产物同源同新）
 concurrency:
   group: marble-system
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   DEV_REPO: https://github.com/droidian-marble/droidian-xiaomi-marble.git
@@ -117,6 +125,63 @@ jobs:
             echo "项目 ${DAYS} 天无提交（> ${THRESHOLD}）→ 本次不编译"
             echo "active=false" >> "$GITHUB_OUTPUT"
           fi
+
+  # ---------------------------------------------------------------------------
+  # 0.5 清理旧构建产物 —— 「所有产物都必须来自本工作流」
+  #   删除旧工作流产出的 Release：kernel-* / debug-gki-* / droidian-custom-*
+  #   / 任何 debug-*；gki-* 只留最新 1 个，marble-system-* 只留最新 2 个。
+  #   ★必须 `< /dev/null` 喂 gh，否则同一条管道里 gh 会偷读 while 的 stdin。
+  # ---------------------------------------------------------------------------
+  prune:
+    name: 清理旧构建产物
+    needs: gate
+    if: ${{ always() && needs.gate.outputs.active == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: 删除旧工作流的 Release（保留最新 gki-* 与最新 2 个 marble-system-*）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          ALL=$(gh release list --limit 300 --json tagName,createdAt \
+                 --jq 'sort_by(.createdAt) | reverse | .[] | "\(.createdAt) \(.tagName)"' < /dev/null)
+          n=$(printf '%s\n' "$ALL" | grep -c . || true)
+          echo "===== 现有 Release（$n 个，新→旧） ====="
+          printf '%s\n' "$ALL"
+          KEEP_GKI=$(printf '%s\n' "$ALL" | awk '$2 ~ /^gki-[0-9]+$/ {print $2; exit}')
+          KEEP_SYS=$(printf '%s\n' "$ALL" | awk '$2 ~ /^marble-system-[0-9]+$/ {print $2}' | head -2 | tr '\n' ' ')
+          echo "保留 GKI: ${KEEP_GKI:-<无>}"
+          echo "保留系统包: ${KEEP_SYS:-<无>}"
+          {
+            echo "### 清理旧构建产物"
+            echo "- 保留 GKI: \`${KEEP_GKI:-<无>}\`"
+            echo "- 保留系统包: \`${KEEP_SYS:-<无>}\`"
+            echo ""
+            echo "| 动作 | tag |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$ALL" | while read -r _ tag; do
+            [ -n "${tag:-}" ] || continue
+            keep=false
+            case "$tag" in
+              marble-system-*) case " $KEEP_SYS " in *" $tag "*) keep=true ;; esac ;;
+              gki-*)           [ "$tag" = "$KEEP_GKI" ] && keep=true ;;
+            esac
+            if [ "$keep" = true ]; then
+              echo "KEEP  $tag"
+              echo "| KEEP | \`$tag\` |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "DEL   $tag"
+              echo "| DEL | \`$tag\` |" >> "$GITHUB_STEP_SUMMARY"
+              gh release delete "$tag" --yes --cleanup-tag < /dev/null \
+                || echo "::warning::删除 Release $tag 失败（可能无权限或已不存在）"
+            fi
+          done
+          echo "=== 清理后剩余 ==="
+          gh release list --limit 300 < /dev/null || true
 
   # ---------------------------------------------------------------------------
   # 1. 定制 adaptation 包（性能解锁 / 温控中立化 / SSH 开机自启）
@@ -188,13 +253,14 @@ jobs:
           files: adapt-build.log
 
   # ---------------------------------------------------------------------------
-  # 2. GKI 内核（可选重编）—— 不勾 rebuild_kernel 时整个 job 跳过，
-  #    后面 image job 会直接从最新 gki-* Release 取 boot.img。
+  # 2. GKI 内核 —— ★默认必编：保证整刷包里的内核与本工作流同源同新
+  #    （仅当手动 dispatch 且明确取消勾选 rebuild_kernel 时才跳过，
+  #     此时 image job 会退回取最新 gki-* Release 的 boot.img）
   # ---------------------------------------------------------------------------
   kernel:
-    name: AOSP GKI 内核（可选重编）
+    name: AOSP GKI 内核
     needs: gate
-    if: ${{ needs.gate.outputs.active == 'true' && github.event_name == 'workflow_dispatch' && inputs.rebuild_kernel }}
+    if: ${{ needs.gate.outputs.active == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rebuild_kernel == false) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
