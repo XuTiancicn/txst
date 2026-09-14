@@ -1,5 +1,10 @@
 # Droidian marble — fastboot 整刷包自动构建器
 
+> ⚠️ **本目录是独立工具（本地/独立 CI 可用），不再是仓库的 Actions 入口。**
+> 仓库现在只有一个工作流：`.github/workflows/marble-system.yml`
+> （含定制 adaptation + GKI 内核注入 + 动态 rootfs 容量 + 每天 00:00 北京时间的活跃度门控自动构建）。
+> 下面描述的 `Build Droidian marble fastboot image` 工作流已删除。
+
 把官方 `droidian-xiaomi-marble` 的 **Recovery-only** 产物，扩展为 Droidian 官方推荐的
 **fastboot-flashable 整刷包**（`type: image`）。每次构建都重新克隆最新源码，云编译产出
 含 `flash_all.sh` 的 zip。
@@ -34,7 +39,8 @@ community_devices.yml (type:image)
    git init && git add . && git commit -m "droidian fastboot builder"
    git remote add origin git@github.com:<你>/<repo>.git && git push -u origin main
    ```
-2. 仓库页 **Actions → Build Droidian marble fastboot image → Run workflow**（默认 `image`/`trixie`）
+2. 仓库页 **Actions → Marble 完整系统整刷包（Droidian + GKI 内核）→ Run workflow**
+   （`marble-system.yml`，产物 Release tag `marble-system-<run>`）
 3. 约 30–60 分钟后产物出现在 Release（tag `droidian-image-<run>`）和 Artifacts
 
 每次 Run 都会 `git clone --depth 1 --branch trixie` 拉最新，无需改任何代码。

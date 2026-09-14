@@ -1,0 +1,545 @@
+name: Marble 完整系统整刷包（Droidian + GKI 内核）
+
+# =============================================================================
+# ★唯一入口。一次运行产出「可以直接刷的完整系统」：
+#     data/boot.img        内核（上游 Droidian 的 boot.img，容器/ramdisk/签名原样）
+#     data/boot-gki.img    Google AOSP GKI 内核（本次编的或最新 gki-* Release 的）
+#     data/userdata.img    Droidian 系统本体（LVM 布局：persistent 32M / reserved 32M / rootfs）
+#     flash_all.sh         官方刷入脚本（会清空 userdata）
+#     flash_gki_kernel.sh  只换内核用（单刷 boot_a/boot_b，不动 userdata）
+#
+# ── rootfs 容量：默认「动态」───────────────────────────────────────────────
+#   上游 rootfs-templates/scripts/genimage.sh 只做**小镜像**
+#     IMG_SIZE = du -sm(rootfs) + 250 + 32 + 32 MiB
+#   并在 rootfs 里打标记 /var/lib/halium/requires-lvm-resize
+#   ⇒ 首次启动由 halium init 把 LVM PV/LV 扩到 **userdata 分区满**。
+#   上游 droidian-images/droidian README 原文：
+#     "Fastboot-flashable images ... make use of the whole userdata partition."
+#   ⇒ 256GB 机型刷完就是 ~230+ GiB 的 rootfs，不需要、也不可能做 256GB 镜像
+#     （fastboot flash userdata 的镜像不能大于 userdata 分区）。
+#   需要固定容量时（动态扩容万一失效的兜底）填 rootfs_size_gb，例如 100。
+#
+# ── 自动编译只在项目活跃时进行 ──────────────────────────────────────────
+#   gate job 读 main 上最后一次提交距今的天数：> activity_days(默认30) 即
+#   整体跳过，不烧 CI。手动 Run workflow 可勾 force 忽略闸门。
+#   每天北京时间 00:00 跑一遍（GitHub cron 用 UTC，故写 0 16 * * *）。
+# =============================================================================
+
+on:
+  schedule:
+    # 北京时间 00:00 == UTC 16:00（前一天）
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略活跃度闸门，强制构建'
+        type: boolean
+        default: true
+      activity_days:
+        description: '活跃度阈值（天）：最后一次提交超过它就跳过自动构建'
+        type: string
+        default: '30'
+      edition:
+        description: '桌面环境：phosh=有桌面（完整系统）/ minimal=纯服务端无桌面'
+        type: choice
+        default: phosh
+        options:
+          - phosh
+          - minimal
+      rootfs_size_gb:
+        description: 'rootfs 固定容量 GiB（留空=动态，用满 userdata 分区；填 100 = 100GiB）'
+        type: string
+        default: ''
+      rebuild_kernel:
+        description: '重编 GKI 内核（勾上=跑 60~240 分钟；不勾=直接用最新 gki-* Release）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 一次只跑一个，避免两个 debos 抢资源（不打断已在跑的）
+concurrency:
+  group: marble-system
+  cancel-in-progress: false
+
+env:
+  DEV_REPO: https://github.com/droidian-marble/droidian-xiaomi-marble.git
+  DEV_BRANCH: droidian
+  DROIDIAN_VERSION: next
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. 活跃度闸门 —— 项目不活跃就不编译
+  # ---------------------------------------------------------------------------
+  gate:
+    name: 活跃度闸门
+    runs-on: ubuntu-latest
+    outputs:
+      active: ${{ steps.g.outputs.active }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - id: g
+        env:
+          THRESHOLD: ${{ inputs.activity_days || '30' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          {
+            echo "### 活跃度闸门"
+            echo "- 事件: ${GITHUB_EVENT_NAME}"
+            echo "- main 最后一次提交: $(date -u -d @$LAST '+%F %T UTC') → **${DAYS} 天前**"
+            echo "- 阈值: ${THRESHOLD} 天"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FORCE" = "true" ]; then
+            echo "手动强制构建 → 忽略闸门"; echo "active=true" >> "$GITHUB_OUTPUT"
+          elif [ "$DAYS" -le "$THRESHOLD" ]; then
+            echo "项目活跃（${DAYS} ≤ ${THRESHOLD}）→ 继续构建"
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "项目 ${DAYS} 天无提交（> ${THRESHOLD}）→ 本次不编译"
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 1. 定制 adaptation 包（性能解锁 / 温控中立化 / SSH 开机自启）
+  # ---------------------------------------------------------------------------
+  adaptation:
+    name: 定制 adaptation deb
+    needs: gate
+    if: needs.gate.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    container: quay.io/droidian/build-essential:current-amd64
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 依赖（跨架构工具 + debhelper）
+        run: |
+          dpkg --add-architecture arm64
+          apt-get update -qq
+          apt-get install -y -qq --allow-downgrades \
+            devscripts equivs crossbuild-essential-arm64 debhelper fakeroot
+
+      - name: 编定制 adaptation deb
+        run: |
+          set -o pipefail
+          chmod +x custom/scripts/build-adaptation-deb.sh
+          set +e
+          WORK="$PWD/work-adapt" OUT="$PWD/out-adapt" \
+            bash -x ./custom/scripts/build-adaptation-deb.sh > adapt-build.log 2>&1
+          rc=$?
+          set -e
+          echo "=========== adaptation 构建日志（尾部 80 行） ==========="
+          tail -80 adapt-build.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::adaptation 编包失败 rc=$rc"
+            grep -aE '^(E: |dh_|dpkg-|make|sed|cp:|.*error:|.*Error |Unmet|unmet|No such|cannot|not found)' \
+              adapt-build.log | tail -8 | while IFS= read -r l; do
+                echo "::error::${l//%/%%}"
+              done || true
+            exit "$rc"
+          fi
+
+      - name: 校验 deb 内容
+        run: |
+          set -x
+          DEB=$(ls out-adapt/*.deb | head -1)
+          dpkg-deb -I "$DEB" | head -20
+          dpkg-deb -c "$DEB" | grep -E 'droidian-perf|perf-guard|droid-vendor-overlay' || true
+          T=$(mktemp -d); dpkg-deb -x "$DEB" "$T"
+          grep -n 'performance\|pkill\|ctl.stop' "$T/usr/bin/droidian-perf.sh" | head
+          cat "$T/usr/lib/droid-vendor-overlay/etc/thermal-engine.conf"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: custom-adaptation-debs
+          path: out-adapt/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 失败时发布构建日志到 Release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-adapt-${{ github.run_number }}
+          name: "[debug] adaptation 构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: adapt-build.log
+
+  # ---------------------------------------------------------------------------
+  # 2. GKI 内核（可选重编）—— 不勾 rebuild_kernel 时整个 job 跳过，
+  #    后面 image job 会直接从最新 gki-* Release 取 boot.img。
+  # ---------------------------------------------------------------------------
+  kernel:
+    name: AOSP GKI 内核（可选重编）
+    needs: gate
+    if: ${{ needs.gate.outputs.active == 'true' && github.event_name == 'workflow_dispatch' && inputs.rebuild_kernel }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾磁盘（内核源码 ~1.5G + 官方 clang ~1.5G + FULL-LTO 产物）
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          # 保留 runner 自带 swap：compile_kernel.sh 还会再挂 8G(/mnt/swap8g)，
+          # FULL-LTO 链接阶段吃内存，两个 swap 叠加更稳
+          swap-storage: false
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          # binutils-aarch64-linux-gnu: 让 kbuild 的 `which aarch64-linux-gnu-elfedit`
+          # 能解析到 /usr/bin/ ⇒ --prefix=/usr/bin/aarch64-linux-gnu- 正常
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            cpio kmod zstd lz4 xz-utils device-tree-compiler \
+            binutils-aarch64-linux-gnu \
+            python3 python3-yaml git
+          df -h / | tail -1
+
+      - name: 编 AOSP GKI 内核 + 用原厂容器重打包
+        env:
+          # 默认 1 = 官方预编译 clang r416183b（与原厂 banner 一致，必须的）
+          USE_AOSP_CLANG: '1'
+          GKI_REF: android12-5.10.209_r00
+        run: |
+          set -o pipefail
+          chmod +x scripts/build_gki_aosp.sh scripts/compile_kernel.sh
+          set +e
+          bash scripts/build_gki_aosp.sh > gki-build.log 2>&1
+          rc=$?
+          set -e
+          grep -nE '^I: |^W: |^E: ' gki-build.log | tail -70 || true
+          if [ "$rc" -ne 0 ]; then
+            echo "===== 关键错误行 ====="
+            grep -nE "error:|Error [0-9]+|Killed|fatal|No space left|undefined reference|E: " gki-build.log | head -40 || true
+            tail -60 gki-build.log
+            echo "::error::AOSP GKI 内核构建失败 rc=$rc"
+          fi
+          exit "$rc"
+
+      - name: 产物摘要
+        if: success()
+        run: |
+          ls -lh dist/
+          cat dist/gki-info.txt
+
+      - name: 交付 boot.img（给 image job 注入用）
+        if: success()
+        run: |
+          mkdir -p gki-boot
+          cp dist/boot.img gki-boot/boot.img
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: marble-gki-boot
+          path: gki-boot/boot.img
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 发布 GKI 内核 Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gki-${{ github.run_number }}
+          name: "Marble AOSP GKI kernel #${{ github.run_number }}"
+          body: |
+            用 **Google AOSP 官方内核源码**为 marble 编的 GKI 内核。
+            产物会由本工作流的整刷包自动取用（`data/boot-gki.img`）。
+
+            - 源码: `aosp-mirror/kernel_common @ android12-5.10.209_r00`
+              (= 原厂 HyperOS OS2.0.5.0.VMRCNXM 内核基线 v5.10.209, KMI 代号 android12-9)
+            - 工具链: 官方预编译 clang r416183b (clang 12.0.5, 与原厂 banner 一致)
+            - boot 容器: 原厂 `OS2.0.5.0.VMRCNXM/images/boot.img` 的 header+ramdisk+signature
+              (只替换内核段；内核段为 raw 未压缩 arm64 Image —— marble ABL 不认 gzip 段)
+            - 提交: `${{ github.sha }}`
+          files: |
+            dist/boot.img
+            dist/gki-marble-sideload.zip
+            dist/Image
+            dist/gki-aosp-used.config
+            dist/gki-info.txt
+          fail_on_unmatched_files: false
+          make_latest: false
+
+      - name: 失败时发布完整日志到 Release（公开可下，零凭据）
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-gki-${{ github.run_number }}
+          name: "[debug] GKI 内核构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: gki-build.log
+
+  # ---------------------------------------------------------------------------
+  # 3. 完整系统整刷包
+  # ---------------------------------------------------------------------------
+  image:
+    name: 完整系统整刷包（${{ inputs.edition || 'phosh' }}）
+    # ★ always()：kernel job 是可选跳过项，不能因此把本 job 带跳过
+    needs: [gate, adaptation, kernel]
+    if: ${{ always() && needs.gate.outputs.active == 'true' && needs.adaptation.result == 'success' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      EDITION: ${{ inputs.edition || 'phosh' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 腾空间（debos 要建 loop/LVM）
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
+                      /usr/share/swift /usr/local/share/boost 2>/dev/null || true
+          df -h / | tail -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: custom-adaptation-debs
+          path: out-adapt
+
+      - name: 依赖（apt-ftparchive 生成内部源索引）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils
+
+      - name: 取 GKI 内核 boot.img（本次构建优先，否则最新 gki-* Release）
+        id: kboot
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -f gki-boot/boot.img ]; then
+            cp gki-boot/boot.img boot-gki.img
+            echo "GKI 内核来源: 本次 workflow 重编"
+            echo "note=本次 workflow 重编" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG=$(gh release list --limit 200 --json tagName --jq '.[].tagName' 2>/dev/null \
+                  | grep -E '^gki-[0-9]+$' | head -1 || true)
+          if [ -z "$TAG" ]; then
+            echo "::warning::没有 gki-* Release 可下载，整刷包里不带 GKI 内核（其余照常）"
+            exit 0
+          fi
+          mkdir -p gki-dl
+          gh release download "$TAG" --pattern boot.img --dir gki-dl
+          cp gki-dl/boot.img boot-gki.img
+          echo "GKI 内核来源: Release $TAG"
+          echo "note=Release $TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 准备镜像配方（源码级改造 + 动态/固定容量）
+        env:
+          ROOTFS_SIZE_GB: ${{ inputs.rootfs_size_gb || '' }}
+        run: |
+          chmod +x custom/scripts/prepare-image.sh
+          WORK="$PWD/work-src-${EDITION}" EDITION="${EDITION}" DEBS="$PWD/out-adapt" \
+            ROOTFS_SIZE_GB="${ROOTFS_SIZE_GB}" \
+            ./custom/scripts/prepare-image.sh
+
+      - name: debos 构建（官方 rootfs-builder 容器，arm64 原生）
+        run: |
+          set -o pipefail
+          SRC="$PWD/work-src-${EDITION}"
+          # ★ 设备仓库在 $SRC/src（prepare-image.sh 克隆到这里），不是 $SRC 本身。
+          DSRC="$SRC/src"
+          mkdir -p "$SRC/out"
+          if [ ! -f "$DSRC/generate_device_recipe.py" ]; then
+            echo "::error::$DSRC 下没有 generate_device_recipe.py"
+            ls -la "$SRC" "$DSRC" 2>/dev/null || true
+            exit 1
+          fi
+          CID=$(docker run --detach --privileged --cgroupns=host \
+                  -v "$SRC/out:/buildd/out" \
+                  -v /dev:/host-dev \
+                  -v /sys/fs/cgroup:/sys/fs/cgroup \
+                  -v "$DSRC:/buildd/sources" \
+                  --security-opt seccomp:unconfined \
+                  quay.io/droidian/rootfs-builder:next-arm64 sleep infinity)
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          set +e
+          docker exec "$CID" /bin/sh -c '
+            set -ex
+            cd /buildd/sources
+            export DROIDIAN_VERSION="'"$DROIDIAN_VERSION"'"
+            ./generate_device_recipe.py xiaomi_marble arm64 "'"${EDITION}"'" phone 32 ""
+            echo "===== generated/droidian.yaml ====="; cat generated/droidian.yaml
+            echo "===== rootfs 尺寸相关配方 (genimage.sh) ====="; grep -n "IMG_SIZE\|userdata.raw\|requires-lvm-resize" rootfs-templates/scripts/genimage.sh || true
+            debos --disable-fakemachine generated/droidian.yaml
+            cp -r /buildd/sources/out/. /buildd/out/ 2>/dev/null || true
+            echo "===== /buildd/out ====="; ls -lh /buildd/out/ || true
+          ' 2>&1 | tee debos.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          tail -60 debos.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::debos 构建失败 rc=$rc"
+            exit "$rc"
+          fi
+
+      - name: 装配最终包（注入 GKI 内核 + 追加刷写脚本）
+        run: |
+          set -euo pipefail
+          SRC="$PWD/work-src-${EDITION}"
+          PKG="$PWD/dist"
+          rm -rf "$PKG"; mkdir -p "$PKG"
+          ZIP=$(ls "$SRC"/out/*.zip | head -1)
+          BASE=$(basename "$ZIP")
+          cp "$ZIP" "$PKG/$BASE"
+          echo "===== 上游产物 ====="; ls -lh "$SRC"/out/
+          echo "===== zip 内容 ====="; unzip -l "$PKG/$BASE"
+
+          # ★ 不整包解压：只把要新增的条目摆成相同相对路径，再用 zip -g 追加。
+          #   userdata.img 那几个大件原样保留，不重新压缩（省时间省磁盘）。
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/data"
+
+          if [ -f boot-gki.img ]; then
+            cp boot-gki.img "$STAGE/data/boot-gki.img"
+            cat > "$STAGE/flash_gki_kernel.sh" <<'EOS'
+          #!/usr/bin/env bash
+          # 只换内核：把 Google AOSP GKI 内核刷进 A/B 两个 boot 槽，不动 userdata。
+          # 上游那个 data/boot.img（Droidian 自带内核）保持原样，随时可以刷回去。
+          set -euo pipefail
+          [ -f data/boot-gki.img ] || { echo "E: 缺少 data/boot-gki.img" >&2; exit 1; }
+          command -v fastboot >/dev/null || { echo "E: 缺少 fastboot" >&2; exit 1; }
+          fastboot devices
+          fastboot flash boot_a data/boot-gki.img
+          fastboot flash boot_b data/boot-gki.img
+          fastboot reboot
+          echo "已刷入 GKI 内核并重启"
+          EOS
+            chmod +x "$STAGE/flash_gki_kernel.sh"
+            cat > "$STAGE/README-FLASH.md" <<'EOS'
+          # marble 完整系统整刷包（Droidian + GKI 内核）
+
+          ## 一、整刷（会清空 userdata）
+          解压 → 手机关机 → 音量下+电源 进 fastboot → `./flash_all.sh`
+
+          首次启动会自动把 LVM 扩到 **userdata 分区满**（256GB 机型 → ~230+ GiB rootfs）。
+          默认解锁密码 `1234`。
+
+          ## 二、只要换内核
+          `./flash_gki_kernel.sh` —— 把 `data/boot-gki.img` 刷进 boot_a/boot_b，不动 userdata。
+          想刷回 Droidian 自带内核：`fastboot flash boot_a data/boot.img`（boot_b 同理）。
+
+          ## 三、包里都是什么
+          | 文件 | 说明 |
+          |---|---|
+          | `data/userdata.img` | Droidian 系统本体（LVM：persistent 32M / reserved 32M / rootfs） |
+          | `data/boot.img` | 上游 Droidian 内核（容器/ramdisk/签名原样，兜底用） |
+          | `data/boot-gki.img` | Google AOSP GKI 内核（原厂基线 v5.10.209，KMI android12-9） |
+          | `data/dtbo.img` / `data/vbmeta.img` | 如有则由上游带出 |
+          | `flash_all.sh` | 上游官方整刷脚本 |
+          EOS
+          else
+            cat > "$STAGE/README-FLASH.md" <<'EOS'
+          # marble 完整系统整刷包（Droidian）
+
+          ## 整刷（会清空 userdata）
+          解压 → 手机关机 → 音量下+电源 进 fastboot → `./flash_all.sh`
+
+          首次启动会自动把 LVM 扩到 **userdata 分区满**（256GB 机型 → ~230+ GiB rootfs）。
+          默认解锁密码 `1234`。
+
+          本次未注入 GKI 内核（没找到可用产物），包里内核为上游 Droidian 自带。
+          EOS
+          fi
+
+          ADD=(README-FLASH.md)
+          if [ -f "$STAGE/data/boot-gki.img" ]; then
+            ADD+=(data/boot-gki.img flash_gki_kernel.sh)
+          fi
+          ( cd "$STAGE" && zip -9 -g "$PKG/$BASE" "${ADD[@]}" )
+          echo "===== 追加后 zip 内容 ====="; unzip -l "$PKG/$BASE"
+
+          # Release 单文件上限 2 GiB ⇒ 超了自动分卷
+          SZ=$(stat -c%s "$PKG/$BASE")
+          echo "包大小: $SZ 字节 ($(( SZ / 1024 / 1024 )) MiB)"
+          if [ "$SZ" -gt $(( 2 * 1024 * 1024 * 1024 )) ]; then
+            echo "::warning::超过 Release 2 GiB 单文件上限 → 分卷（1900 MiB/卷）"
+            ( cd "$PKG" && zip -s 1900m "$BASE" --out "${BASE%.zip}-split.zip" )
+            rm -f "$PKG/$BASE"
+          fi
+          ( cd "$PKG" && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          ls -lh "$PKG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marble-full-system-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 发布 Release（完整系统整刷包）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: marble-system-${{ github.run_number }}
+          name: "Marble 完整系统整刷包（Droidian ${{ inputs.edition || 'phosh' }}） #${{ github.run_number }}"
+          body: |
+            **可以直接刷的完整 Droidian 系统整刷包**（fastboot-flashable）
+
+            | 项 | 值 |
+            |---|---|
+            | 设备 | 红米 Note 12 Turbo / POCO F5 (marble, SM7475) |
+            | edition | `${{ inputs.edition || 'phosh' }}` |
+            | rootfs 容量 | ${{ inputs.rootfs_size_gb && format('固定 {0} GiB', inputs.rootfs_size_gb) || '**动态**（首启扩到 userdata 分区满）' }} |
+            | GKI 内核 | ${{ steps.kboot.outputs.note || '未注入（只带上游 Droidian 内核）' }} |
+            | 上游 HEAD | `${{ github.sha }}` |
+
+            **刷入**
+            1. 解压 zip
+            2. 手机关机 → 音量下+电源 进 fastboot
+            3. `./flash_all.sh`（会清空 userdata；A/B 双槽请保持同一 Android 版本）
+            4. 只换内核用 `./flash_gki_kernel.sh`（不动 userdata）
+            5. 默认解锁密码 `1234`
+
+            **本包相对上游的改动（全部在源码层面）**
+            - cpufreq 默认/保活 = `performance`（开机 oneshot + 60s 幂等保活 timer）
+            - 中立化 vendor `thermal-engine.conf` / `thermal-normal.conf`，停掉 Android 侧温控守护
+            - 解开 `core_ctl` / devfreq `boost_freq` 等性能旋钮
+            - 安装并开机启用 **OpenSSH**（`droidian` / `1234`）
+            - 补充 Linux server 常用组件（见 `custom/scripts/prepare-image.sh`）
+
+            **安全边界（故意没动）**：充电热保护 `thermal-chg-only.conf`、内核 DTS critical trip（~115℃）
+
+            **rootfs 容量**：上游 fastboot 镜像按设计"make use of the whole userdata partition"，
+            首启靠 `/var/lib/halium/requires-lvm-resize` 把 LVM 扩到分区满 —— 256GB 机型刷完即 ~230+ GiB。
+            注意 `fastboot flash userdata` 的镜像**不能大于 userdata 分区**，所以不存在 256GB 镜像这回事。
+
+            **自动构建**：每天北京时间 00:00（仅当项目活跃；`main` 上超过
+            `${{ inputs.activity_days || '30' }}` 天没提交则自动跳过）
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: false
+
+      - name: 失败时发布 debos 日志到 Release
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-system-${{ github.run_number }}
+          name: "[debug] 整刷包构建日志 #${{ github.run_number }}"
+          body: |
+            失败运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: debos.log

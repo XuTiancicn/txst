@@ -23,6 +23,7 @@ DEV_REPO="${DEV_REPO:-https://github.com/droidian-marble/droidian-xiaomi-marble.
 DEV_BRANCH="${DEV_BRANCH:-droidian}"
 
 log() { echo "I: $*"; }
+warn() { echo "W: $*" >&2; }
 die() { echo "E: $*" >&2; exit 1; }
 
 [ -d "$DEBS" ] || die "找不到 deb 目录: $DEBS"
@@ -41,6 +42,59 @@ echo "上游 HEAD: $(git rev-parse --short HEAD)"
 log "== submodule（debos 配方 + flashing 模板） =="
 git submodule update --init --recursive
 git submodule status
+
+# ------------------------------------------------- 0.5 rootfs 容量策略
+# ★默认「动态容量」——不用改任何配方：
+#   上游 rootfs-templates/scripts/genimage.sh 建的是**小镜像**
+#       IMG_SIZE = du -sm(rootfs) + 250 + 32 + 32   (MiB)
+#   并在 rootfs 里打标记 /var/lib/halium/requires-lvm-resize，
+#   首次启动由 halium init 把 LVM PV/LV 扩到 **userdata 分区满**。
+#   上游 droidian-images/droidian README 原文：
+#       "Fastboot-flashable images ... make use of the whole userdata partition."
+#   ⇒ 256GB 机型刷完就是 ~230+ GiB 的 rootfs。
+#   ★物理上限：fastboot flash userdata 的镜像不能大于 userdata 分区，
+#     所以"做 256GB 镜像"既没必要也不可能（256GB 机型 userdata ≈230–238 GiB）。
+#
+# 固定容量兜底（ROOTFS_SIZE_GB=N，例如 100）：动态扩容万一在某设备失灵时用。
+ROOTFS_SIZE_GB="${ROOTFS_SIZE_GB:-}"
+GENIMAGE="rootfs-templates/scripts/genimage.sh"
+if [ -n "$ROOTFS_SIZE_GB" ]; then
+    log "== rootfs 固定容量: ${ROOTFS_SIZE_GB} GiB =="
+    [ -f "$GENIMAGE" ] || die "找不到 $GENIMAGE"
+    case "$ROOTFS_SIZE_GB" in
+        ''|*[!0-9]*) die "ROOTFS_SIZE_GB 必须是整数（GiB），当前='$ROOTFS_SIZE_GB'" ;;
+    esac
+    [ "$ROOTFS_SIZE_GB" -le 220 ] || warn "!! ${ROOTFS_SIZE_GB} GiB 很可能大于 userdata 分区（256GB 机型 ≈230–238 GiB）⇒ fastboot 会报 image too large"
+    python3 - "$ROOTFS_SIZE_GB" <<'PYEOF'
+import io, re, sys
+gb = int(sys.argv[1]); mib = gb * 1024
+p = "rootfs-templates/scripts/genimage.sh"
+s = io.open(p, encoding="utf-8").read()
+if "MARBLE_FIXED_SIZE" in s:
+    print("I:   genimage.sh 已打过补丁，跳过"); raise SystemExit(0)
+s2 = re.sub(r'IMG_SIZE=\$\(\([^\n]*\)\)[^\n]*',
+            'IMG_SIZE=%d # MARBLE_FIXED_SIZE (%d GiB)' % (mib, gb), s, count=1)
+if s2 == s:
+    sys.exit("E: genimage.sh 里找不到 IMG_SIZE=... 行（上游配方变了，请更新本补丁）")
+s3 = s2.replace(
+    'dd if=/dev/zero of=${WORK_DIR}/userdata.raw bs=1M count=${IMG_SIZE}',
+    'truncate -s ${IMG_SIZE}M ${WORK_DIR}/userdata.raw # MARBLE_FIXED_SIZE(稀疏文件, 不真写零)')
+if s3 == s2:
+    sys.exit("E: genimage.sh 里找不到 dd 建 userdata.raw 的行（上游配方变了，请更新本补丁）")
+io.open(p, "w", encoding="utf-8", newline="\n").write(s3)
+print("I:   genimage.sh 已改为固定 %d MiB（稀疏文件）" % mib)
+PYEOF
+    grep -n 'IMG_SIZE=\|userdata.raw' "$GENIMAGE"
+else
+    log "== rootfs 动态容量（默认） =="
+    log "   小镜像 + 首启 requires-lvm-resize 扩到 userdata 分区满（上游设计，无需改配方）"
+    if grep -q 'requires-lvm-resize' "$GENIMAGE"; then
+        grep -n 'IMG_SIZE=\|requires-lvm-resize' "$GENIMAGE" | sed 's/^/I:   /'
+    else
+        warn "!! genimage.sh 里没有 requires-lvm-resize 标记 —— 首启自动扩容可能失效"
+        warn "   若刷完 df 发现 rootfs 太小，用 ROOTFS_SIZE_GB=100 出固定容量版本"
+    fi
+fi
 
 # ------------------------------------------------------------------ 1. 内部 apt 源
 log "== 注入定制 deb 到 apt/ （内部仓库） =="

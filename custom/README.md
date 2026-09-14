@@ -47,17 +47,24 @@ adaptation-xiaomi-marble @ droidian      ← 设备适配包（.deb）
 
 ## 三、怎么跑
 
-Actions → **Build custom Droidian marble image (perf-max / SSH / DE optional)** → Run workflow
+**唯一入口**：Actions → **Marble 完整系统整刷包（Droidian + GKI 内核）** → Run workflow
+（`.github/workflows/marble-system.yml`；旧的 `build-kernel` / `build-custom-image` /
+`build-fastboot` 三个工作流已合并删除）
 
 | 输入 | 说明 |
 |---|---|
-| `editions` | `both` / `phosh`（有桌面）/ `minimal`（纯服务端无桌面） |
-| `build_kernel` | 是否同时出性能解锁内核 `boot.img` |
-| `dev_branch` | 默认 `droidian` |
+| `edition` | `phosh`（有桌面，完整系统）/ `minimal`（纯服务端无桌面） |
+| `rootfs_size_gb` | 留空 = **动态容量**（首启扩到 userdata 分区满）；填 `100` 等 = 固定容量兜底 |
+| `rebuild_kernel` | 勾上才重编 GKI 内核（60~240 分钟）；不勾 = 直接取最新 `gki-*` Release 的 boot.img |
+| `force` / `activity_days` | 活跃度闸门：`main` 超过 N 天没提交就跳过自动构建，手动勾 `force` 可忽略 |
 
-产出：
-- Release `droidian-custom-<edition>-<run>` → 整刷 zip（解压后 `./flash_all.sh`）
-- Release `kernel-perf-<run>` → `boot.img`（`fastboot flash boot_a/boot_b`）
+自动：**每天北京时间 00:00**（cron `0 16 * * *` UTC）跑一遍，仅在项目活跃时执行。
+
+产出：Release **`marble-system-<run>`** → 一个 zip，解压后
+- `./flash_all.sh` —— 整刷（boot/userdata，会清空 userdata）
+- `./flash_gki_kernel.sh` —— 只换内核（A/B 双槽 boot，不动 userdata）
+- 超 2 GiB 自动分卷（`*-split.z01/.z02/...`），另附 `SHA256SUMS.txt`
+- 失败 → Release `debug-system-<run>`（全量 debos 日志，公开可下，零凭据）
 
 ## 四、安全边界（**故意没动的东西**）
 
