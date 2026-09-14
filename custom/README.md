@@ -68,8 +68,12 @@ adaptation-xiaomi-marble @ droidian      ← 设备适配包（.deb）
 （`cancel-in-progress: true`），不会两个 debos 叠跑。
 
 产出：Release **`marble-system-<run>`** → 一个 zip，解压后
-- `./flash_all.sh` —— 整刷（boot/userdata，会清空 userdata）
-- `./flash_gki_kernel.sh` —— 只换内核（A/B 双槽 boot，不动 userdata）
+- `flash_all.sh` / **`flash_all.bat`** —— 整刷（boot/userdata，会清空 userdata）
+- `flash_gki_kernel.sh` / **`flash_gki_kernel.bat`** —— 只换内核（A/B 双槽 boot，不动 userdata）
+- **Windows 版（.bat）**：源码在 `custom/scripts/flash-windows/`，装配时由 CI 强制转成
+  **CRLF**（`.gitattributes` 里 `*.bat text eol=crlf` 锁死；cmd.exe 逐行解析，LF-only 会让
+  `goto`/`label` 与括号块行为异常）。两个 .bat 会自己读 `data/device-configuration.conf`，
+  支持 A/B 与单槽、大小写分区名四种分支，行为与上游 `.sh` 等价，不需要 WSL/bash。
 - 超 2 GiB 自动分卷（`*-split.z01/.z02/...`），另附 `SHA256SUMS.txt`
 - 失败 → Release `debug-system-<run>`（全量 debos 日志，公开可下，零凭据）
 

@@ -490,6 +490,20 @@ jobs:
           STAGE=$(mktemp -d)
           mkdir -p "$STAGE/data"
 
+          # Windows 批处理（.bat）—— 上游只给 .sh，这里补一份等价实现（含 flash_all.bat）。
+          # ★ 必须 CRLF：cmd.exe 逐行解析，LF-only 会让 goto/label 与括号块行为异常。
+          #   这里用 sed 再兜一道，防止 checkout 时被转成 LF。
+          WINPY="$PWD/custom/scripts/flash-windows"
+          if [ -d "$WINPY" ]; then
+            for f in "$WINPY"/*.bat; do
+              [ -f "$f" ] || continue
+              sed 's/\r*$/\r/' "$f" > "$STAGE/$(basename "$f")"
+            done
+            echo "===== Windows 脚本 ====="; ls -l "$STAGE"/*.bat
+          else
+            echo "::warning::找不到 $WINPY —— 本次包里不带 .bat"
+          fi
+
           if [ -f boot-gki.img ]; then
             cp boot-gki.img "$STAGE/data/boot-gki.img"
             cat > "$STAGE/flash_gki_kernel.sh" <<'EOS'
@@ -509,14 +523,28 @@ jobs:
             cat > "$STAGE/README-FLASH.md" <<'EOS'
           # marble 完整系统整刷包（Droidian + GKI 内核）
 
+          ## 零、Windows 用户先看这里
+          包里**同时给了 Windows 批处理**，不需要装 bash/WSL：
+
+          | 场景 | Windows | Linux / macOS |
+          |---|---|---|
+          | 整刷（会清空 userdata） | 双击 `flash_all.bat` | `./flash_all.sh` |
+          | 只换内核 | 双击 `flash_gki_kernel.bat` | `./flash_gki_kernel.sh` |
+
+          前提：装好 Android platform-tools 并把目录加进 PATH；手机进 fastboot；
+          新开一个 cmd 执行 `fastboot devices` 能看到序列号。
+          两个 `.bat` 会自己读 `data/device-configuration.conf` 判断分区命名方式，
+          并按包里实际存在的镜像决定刷哪些分区（与 `.sh` 行为一致）。
+
           ## 一、整刷（会清空 userdata）
-          解压 → 手机关机 → 音量下+电源 进 fastboot → `./flash_all.sh`
+          解压 → 手机关机 → 音量下+电源 进 fastboot → Windows 跑 `flash_all.bat`，
+          Linux/macOS 跑 `./flash_all.sh`。
 
           首次启动会自动把 LVM 扩到 **userdata 分区满**（256GB 机型 → ~230+ GiB rootfs）。
           默认解锁密码 `1234`。
 
           ## 二、只要换内核
-          `./flash_gki_kernel.sh` —— 把 `data/boot-gki.img` 刷进 boot_a/boot_b，不动 userdata。
+          把 `data/boot-gki.img` 刷进 boot_a/boot_b，不动 userdata。
           想刷回 Droidian 自带内核：`fastboot flash boot_a data/boot.img`（boot_b 同理）。
 
           ## 三、包里都是什么
@@ -526,14 +554,22 @@ jobs:
           | `data/boot.img` | 上游 Droidian 内核（容器/ramdisk/签名原样，兜底用） |
           | `data/boot-gki.img` | Google AOSP GKI 内核（原厂基线 v5.10.209，KMI android12-9） |
           | `data/dtbo.img` / `data/vbmeta.img` | 如有则由上游带出 |
-          | `flash_all.sh` | 上游官方整刷脚本 |
+          | `flash_all.sh` / `flash_all.bat` | 整刷（`.bat` 是上游 `.sh` 的 Windows 等价实现） |
+          | `flash_gki_kernel.sh` / `flash_gki_kernel.bat` | 只换内核 |
           EOS
           else
             cat > "$STAGE/README-FLASH.md" <<'EOS'
           # marble 完整系统整刷包（Droidian）
 
+          ## 零、Windows 用户先看这里
+          包里**同时给了 Windows 批处理**，不需要装 bash/WSL：
+          双击 `flash_all.bat` 即可（Linux/macOS 用 `./flash_all.sh`）。
+          前提：装好 Android platform-tools 并把目录加进 PATH；手机进 fastboot；
+          新开一个 cmd 执行 `fastboot devices` 能看到序列号。
+
           ## 整刷（会清空 userdata）
-          解压 → 手机关机 → 音量下+电源 进 fastboot → `./flash_all.sh`
+          解压 → 手机关机 → 音量下+电源 进 fastboot → Windows 跑 `flash_all.bat`，
+          Linux/macOS 跑 `./flash_all.sh`。
 
           首次启动会自动把 LVM 扩到 **userdata 分区满**（256GB 机型 → ~230+ GiB rootfs）。
           默认解锁密码 `1234`。
@@ -543,9 +579,14 @@ jobs:
           fi
 
           ADD=(README-FLASH.md)
+          if [ -f "$STAGE/flash_all.bat" ]; then ADD+=(flash_all.bat); fi
           if [ -f "$STAGE/data/boot-gki.img" ]; then
             ADD+=(data/boot-gki.img flash_gki_kernel.sh)
+            if [ -f "$STAGE/flash_gki_kernel.bat" ]; then ADD+=(flash_gki_kernel.bat); else rm -f "$STAGE/flash_gki_kernel.bat"; fi
+          else
+            rm -f "$STAGE/flash_gki_kernel.bat"
           fi
+          echo "===== 本次追加的条目 ====="; printf '  %s\n' "${ADD[@]}"
           ( cd "$STAGE" && zip -9 -g "$PKG/$BASE" "${ADD[@]}" )
           echo "===== 追加后 zip 内容 ====="; unzip -l "$PKG/$BASE"
 

@@ -8,3 +8,7 @@
 *.json text eol=lf
 *.md text eol=lf
 .gitignore text eol=lf
+# ★ Windows 批处理必须是 CRLF：cmd.exe 逐行解析，LF-only 会让 goto/label 与
+# 括号块行为异常；同时必须是 UTF-8 无 BOM（有 BOM 时第一行 @echo off 会失效并回显）。
+*.bat text eol=crlf
+*.cmd text eol=crlf
