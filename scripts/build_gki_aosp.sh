@@ -31,16 +31,37 @@
 # 原厂版本串(实测从原厂 boot.img 内核段 banner 直接读出, 不是猜的):
 #     5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661
 #
-# 版本串的三段构成与复刻方式:
-#   5.10.209                             <- 源码树 Makefile 的 SUBLEVEL(选 tag)
+# 版本串的三段构成与复刻方式(全部有源码依据, 逐行可查):
+#   5.10.209                             <- Makefile VERSION/PATCHLEVEL/SUBLEVEL(选 tag)
 #   -android12-9                         <- GKI KMI 代号(build.config.common:
 #                                           BRANCH=android12-5.10 KMI_GENERATION=9)
-#   -00019-g4ea09a298bb4-ab12292661      <- AOSP 构建号(源码树 git describe + ab)
-# 复刻手段: 把后两段整体写进 CONFIG_LOCALVERSION, 并关掉 LOCALVERSION_AUTO,
-# 同时把 LOCALVERSION 环境变量"置为空但存在"以绕开 scripts/setlocalversion
-# 在非 tag 提交上追加 '+' 的分支。然后:
-#   编译前 -> make kernelrelease 断言(秒级, 早失败)
+#   -00019-g4ea09a298bb4-ab12292661      <- AOSP 构建号(git describe + ab)
+#
+#   [基线]      由 tag 决定, 不用管
+#   [KMI+describe] -> CONFIG_LOCALVERSION
+#       依据 scripts/setlocalversion:200  res="${res}${CONFIG_LOCALVERSION}${LOCALVERSION}"
+#   [-ab<号>]   -> 环境变量 BUILD_NUMBER
+#       依据 Makefile:1390  ifneq (,$(BUILD_NUMBER)) UTS_RELEASE=$(KERNELRELEASE)-ab$(BUILD_NUMBER)
+#       (故 CONFIG_LOCALVERSION 里不能自带 -ab 段, 否则重复)
+#   [抑制追加 '+'] -> 把 LOCALVERSION 置为"空但已定义"
+#       依据 setlocalversion:211  if test "${LOCALVERSION+set}" != "set"; then res="$res${scm:++}"; fi
+#   [抑制重复 KMI] -> 不向 make 传 BRANCH/KMI_GENERATION
+#       依据 Makefile:2029  setlocalversion <srctree> $(BRANCH) $(KMI_GENERATION)
+#       (传了会再加一次 -android12-9, 所以此处刻意不传)
+#
+# ★踩过的坑(run#23 就死在这, 日志 Release tag debug-gki-23):
+#   `make kernelrelease` 在 no-sync-config-targets 里(Makefile:289) ⇒ 走 config-build
+#   分支(见 Makefile:633 `else #!config-build` 之后才是 auto.conf 那套), 既不生成也不
+#   包含 include/config/auto.conf; 而 setlocalversion:186 一旦发现 auto.conf 不存在
+#   就直接 `exit 1`, 且只往 stderr 喊("kernelrelease not valid - run 'make prepare'"),
+#   我们的 $( ) 把 stderr 丢了 ⇒ 捕获为空 ⇒ 版本串退化成裸基线 5.10.209。
+#   修法: 断言前显式 `make syncconfig`(= kconfig --syncconfig, 静默) 生成 auto.conf。
+#
+#   编译前 -> make kernelrelease 断言 + auto.conf 内容打印(秒级, 早失败且自带诊断)
 #   编译后 -> 从 Image 里 grep 该串断言(万无一失)
+#   兜底   -> 万一自然路径仍失败, 改用 make 命令行变量 KERNELRELEASE=<原厂串> 钉死
+#             (Makefile:367 是 `KERNELRELEASE = $(shell cat ...)`, 命令行变量优先级更高),
+#             最终验收仍是"Image 里必须能 grep 到原厂串"
 #
 # 用法:
 #   bash scripts/build_gki_aosp.sh
@@ -144,37 +165,83 @@ fi
 # ══════════════════════════════════════════════════ [5/8] 精确复刻版本串
 log "===== [5/8] 复刻原厂 UTS_RELEASE ====="
 KV_BASE="$(make -s ARCH=arm64 kernelversion 2>/dev/null | tail -1 || true)"
-[ -n "$KV_BASE" ] || KV_BASE="$(grep -m1 '^SUBLEVEL' Makefile | awk '{print $3}' | sed 's/^/5.10./')"
+[ -n "$KV_BASE" ] || die "拿不到源码 KERNELVERSION(Makefile 里 VERSION/PATCHLEVEL/SUBLEVEL)"
 log "源码基线 KERNELVERSION = $KV_BASE"
 case "$STOCK_UTS" in
-    "$KV_BASE"*) SUFFIX="${STOCK_UTS#$KV_BASE}" ;;
+    "$KV_BASE"*) SUFFIX="${STOCK_UTS#"$KV_BASE"}" ;;
     *) die "原厂串 $STOCK_UTS 与源码基线 $KV_BASE 不匹配 —— 选错 tag 了? 请换 GKI_REF" ;;
 esac
 [ -n "$SUFFIX" ] || die "无法从 $STOCK_UTS 截出后缀"
-log "要构造的完整 release = ${KV_BASE}${SUFFIX}"
 
-./scripts/config --file .config --set-str LOCALVERSION "$SUFFIX"
+# 拆出 -ab<构建号>: Makefile:1391 自己会补 "-ab$(BUILD_NUMBER)", 不能重复放进 LOCALVERSION
+BUILD_NO=""
+LOCALV_SUFFIX="$SUFFIX"
+case "$SUFFIX" in
+    *-ab[0-9]*) BUILD_NO="${SUFFIX##*-ab}"; LOCALV_SUFFIX="${SUFFIX%-ab*}" ;;
+esac
+[ -n "$LOCALV_SUFFIX" ] || die "LOCALVERSION 段为空, 无法复刻"
+log "CONFIG_LOCALVERSION = '$LOCALV_SUFFIX'"
+log "BUILD_NUMBER        = '${BUILD_NO:-(无)}'"
+log "要构造的完整 release = ${KV_BASE}${LOCALV_SUFFIX}${BUILD_NO:+-ab${BUILD_NO}}"
+
+# ---- (1) 装 CONFIG_LOCALVERSION + 关 LOCALVERSION_AUTO(git describe 自动追加) ----
+./scripts/config --file .config --set-str LOCALVERSION "$LOCALV_SUFFIX"
 ./scripts/config --file .config --disable LOCALVERSION_AUTO
 make ARCH=arm64 LLVM=1 olddefconfig >/dev/null
-# LOCALVERSION 环境变量"置空但存在": scripts/setlocalversion 里
-#   if test "${LOCALVERSION+set}" != "set"; then ... 追加 '+' ...
-# 置空(非 unset)即可走不到那条分支。
-export LOCALVERSION=""
 
-ACTUAL="$(make -s ARCH=arm64 LLVM=1 kernelrelease 2>/dev/null | tail -1)"
-log "make kernelrelease = $ACTUAL"
-[ "$ACTUAL" = "$STOCK_UTS" ] || die "版本串复刻失败: 期望 $STOCK_UTS, 实得 $ACTUAL
-  排查: grep -n LOCALVERSION .config; cat include/config/kernel.release; git describe --tags"
+# ---- (2) ★显式生成 include/config/auto.conf★(run#23 失败根因, 别删这条) ----
+#   `make kernelrelease` 属 no-sync-config-targets(Makefile:289) ⇒ 走 config-build 分支,
+#   既不包含也不生成 auto.conf; 而 scripts/setlocalversion:186 找不到它会 `exit 1`
+#   (错误只走 stderr, 被 $( ) 吞掉) ⇒ 版本串退化成裸基线。必须显式 syncconfig。
+make ARCH=arm64 LLVM=1 syncconfig >/dev/null 2>&1 || true
+[ -f include/config/auto.conf ] || die "make syncconfig 没能生成 include/config/auto.conf"
+log "auto.conf 已就绪: $(grep '^CONFIG_LOCALVERSION' include/config/auto.conf || echo '!! 里面没有 CONFIG_LOCALVERSION')"
+
+# ---- (3) 环境变量 ----
+#   (a) LOCALVERSION "置空但已定义" ⇒ 抑制 setlocalversion:211 追加 '+'
+#   (b) BUILD_NUMBER ⇒ 让 Makefile:1391 补出 "-ab<号>"
+export LOCALVERSION=""
+if [ -n "$BUILD_NO" ]; then export BUILD_NUMBER="$BUILD_NO"; fi
+
+# ---- (4) 断言 + 失败时把诊断一次性全打出来 ----
+#   `|| true` 是给 set -e/pipefail 用的: make 失败也算"实得空串", 走诊断分支而不是直接崩
+ACTUAL="$(make -s ARCH=arm64 LLVM=1 kernelrelease 2>.krel.err | tail -1 || true)"
+KREL_OVERRIDE=""
+if [ "$ACTUAL" = "$STOCK_UTS" ]; then
+    log "自然复刻成功: make kernelrelease = $ACTUAL"
+else
+    warn "自然复刻失败: 期望 '$STOCK_UTS'  实得 '$ACTUAL'"
+    warn "  setlocalversion 直调输出 : '$( (sh scripts/setlocalversion .) 2>&1 || true )'"
+    warn "  .config                  : $(grep -n '^CONFIG_LOCALVERSION' .config || echo '(无)')"
+    warn "  auto.conf                : $(grep -n '^CONFIG_LOCALVERSION' include/config/auto.conf 2>/dev/null || echo '(无)')"
+    warn "  include/config/kernel.release: $(cat include/config/kernel.release 2>/dev/null || echo '(无)')"
+    warn "  make stderr(前5行)       : $(head -5 .krel.err 2>/dev/null | tr '\n' ' ')"
+    if [ -f localversion ]; then warn "  源树根还有 localversion 文件! 内容=$(cat localversion)"; fi
+    warn "→ 启用兜底: 用 make 命令行变量 KERNELRELEASE=$STOCK_UTS 钉死"
+    warn "  (Makefile:367 是 KERNELRELEASE = \$(shell cat ...), 命令行变量优先级更高)"
+    KREL_OVERRIDE="$STOCK_UTS"
+    unset BUILD_NUMBER || true
+fi
 
 # ══════════════════════════════════════════════════ [6/8] 编译
 log "===== [6/8] 编译 Image (共享核心 compile_kernel.sh) ====="
 # 官方 clang 12 不需要 frame-larger-than 降级 ⇒ KCFLAGS 显式置空(保留变量以便覆盖)
-KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image
+if [ -n "$KREL_OVERRIDE" ]; then
+    warn "本次编译用命令行变量 KERNELRELEASE=$KREL_OVERRIDE 钉死版本串"
+    KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image "KERNELRELEASE=$KREL_OVERRIDE"
+else
+    KCFLAGS="${KCFLAGS-}" bash "$ROOT/scripts/compile_kernel.sh" . Image
+fi
 
 # ══════════════════════════════════════════════════ [7/8] 装配 + 双重复核
 log "===== [7/8] 装配 boot.img 并复核 ====="
 IMAGE="$KERNEL_DIR/arch/arm64/boot/Image"
 [ -f "$IMAGE" ] || die "没有 arch/arm64/boot/Image"
+# 编译期真正生效的 UTS_RELEASE(include/generated/utsrelease.h 才是 linux_banner 的来源)
+UTS_H="$KERNEL_DIR/include/generated/utsrelease.h"
+[ -f "$UTS_H" ] || die "没有 include/generated/utsrelease.h"
+log "utsrelease.h: $(grep UTS_RELEASE "$UTS_H")"
+grep -qF "\"$STOCK_UTS\"" "$UTS_H" || die "utsrelease.h 里的 UTS_RELEASE 不是 $STOCK_UTS"
 cp "$IMAGE" "$OUT/Image"
 
 if ! grep -aqF "$STOCK_UTS" "$IMAGE"; then
@@ -222,7 +289,12 @@ python3 "$ROOT/scripts/make_sideload_zip.py" \
   echo "内核源码        : $KERNEL_REPO @ $GKI_REF (Google AOSP kernel/common)"
   echo "源码 sha        : $GIT_SHA"
   echo "源码 git describe: $GIT_DESCRIBE"
-  echo "UTS_RELEASE     : $STOCK_UTS   (与 $STOCK_UTS 完全一致 = 厂商模块可加载)"
+  echo "UTS_RELEASE     : $STOCK_UTS   (与原厂 boot.img banner 完全一致)"
+  if [ -n "$KREL_OVERRIDE" ]; then
+    echo "版本串注入方式  : 兜底 —— make 命令行变量 KERNELRELEASE=$KREL_OVERRIDE (自然复刻未成功)"
+  else
+    echo "版本串注入方式  : 自然 —— CONFIG_LOCALVERSION='$LOCALV_SUFFIX' + BUILD_NUMBER='${BUILD_NO:-}'"
+  fi
   echo "boot 容器来源   : $CONTAINER  ($(python3 -c "import json;print(json.load(open('$CONTAINER/parts.json'))['source'])" 2>/dev/null || echo '?'))"
   echo "容器 ramdisk    : $(python3 -c "import json;print(json.load(open('$CONTAINER/parts.json'))['ramdisk_sha256'])" 2>/dev/null || echo '?')"
   echo "工具链          : $(clang --version | head -1)"

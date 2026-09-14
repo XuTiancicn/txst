@@ -3,10 +3,14 @@
 # compile_kernel.sh — 共用内核编译核心 (两个内核任务单点共用)
 #
 # 负责: swap 兜底 -> make Image(KCFLAGS 修复) -> 失败诊断 -> 产物确认
-# 用法: compile_kernel.sh <内核目录> [make目标, 默认 Image]
+# 用法: compile_kernel.sh <内核目录> [make目标, 默认 Image] [make命令行变量 ...]
+#   例: compile_kernel.sh . Image "KERNELRELEASE=5.10.209-android12-9-..."
+#       (第 3 个参数起原样追加到 make 命令行 —— 命令行变量优先级高于 Makefile 赋值,
+#        用于 build_gki_aosp.sh 的版本串兜底路径; 不传则行为与以前完全一致)
 #
 # 使用方 (改编译参数只改这里, 防止各任务独立维护漏修复):
 #   - .github/workflows/build-kernel.yml  ->  LineageOS 23.2 GKI 内核
+#   - scripts/build_gki_aosp.sh           ->  Google AOSP GKI 内核
 #   - scripts/build_display_kernel.sh     ->  Droidian 5.10.238 + DRM_MSM
 #
 # ⚠ 历史坑 (勿删, 每条都真实炸过 Actions):
@@ -21,8 +25,11 @@
 # =============================================================================
 set -euo pipefail
 
-KDIR="${1:?用法: compile_kernel.sh <内核目录> [make目标, 默认 Image]}"
+KDIR="${1:?用法: compile_kernel.sh <内核目录> [make目标, 默认 Image] [make变量 ...]}"
 TARGET="${2:-Image}"
+if [ $# -ge 1 ]; then shift; fi   # 去掉 KDIR
+if [ $# -ge 1 ]; then shift; fi   # 去掉 TARGET(若给了); 剩下的 "$@" 原样进 make
+[ $# -eq 0 ] || echo "额外 make 变量: $*"
 
 cd "$KDIR" || { echo "无法进入内核目录: $KDIR"; exit 1; }
 echo "===== [编译] swap 兜底 ($PWD) ====="
@@ -49,7 +56,7 @@ echo "===== [编译] make $TARGET (LLVM=1 KCFLAGS=-Wno-frame-larger-than, -j$(np
 #   - 官方 clang r416183b (clang 12) 不需要 ⇒ 调用方传 KCFLAGS= 置空
 KCFLAGS="${KCFLAGS--Wno-frame-larger-than}"
 echo "KCFLAGS='${KCFLAGS}'"
-make ARCH=arm64 LLVM=1 KCFLAGS="$KCFLAGS" -j"$(nproc)" "$TARGET" > build.log 2>&1 &
+make ARCH=arm64 LLVM=1 KCFLAGS="$KCFLAGS" -j"$(nproc)" "$@" "$TARGET" > build.log 2>&1 &
 MPID=$!
 LAST_LINES=0
 while kill -0 "$MPID" 2>/dev/null; do

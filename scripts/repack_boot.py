@@ -2,13 +2,18 @@
 """
 Repack GKI boot v4 image: 复用设备原镜像 header，仅替换其中的内核段。
 
-流程 = 解包产物(header.bin + ramdisk + boot_signature) + 新编译 Image.gz -> 重打包
+流程 = 解包产物(header.bin + ramdisk + boot_signature) + 新编译 Image(raw arm64) -> 重打包
 
 用法:
-  python3 repack_boot.py <Image.gz> <header.bin> <ramdisk> <boot_signature> <output>
+  python3 repack_boot.py <Image> <header.bin> <ramdisk> <boot_signature> <output>
+
+★ 内核段必须是 raw 未压缩 arm64 Image(文件头 4D5A = "MZ", PE/COFF)。
+  marble 的 ABL 不认 gzip 段(实测刷 gzip 段卡第一屏且无 USB) —— 别把这里的
+  参数换成 Image.gz。原厂 OS2.0.5.0.VMRCNXM 的 boot.img 内核段就是 raw。
 
 示例:
-  python3 scripts/repack_boot.py dist/Image.gz stock/header.bin stock/ramdisk stock/boot_signature dist/boot.img
+  python3 scripts/repack_boot.py dist/Image stock-os2050/header.bin stock-os2050/ramdisk \
+          stock-os2050/boot_signature dist/boot.img
 
 说明:
   - header.bin 为设备现刷包 boot.img 解包得到的完整 1584B v4 header，
